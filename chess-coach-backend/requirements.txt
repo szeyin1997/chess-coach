@@ -3,3 +3,4 @@ uvicorn[standard]>=0.22
 python-chess>=1.999
 google-genai
 python-dotenv>=1.0
+zstandard>=0.21

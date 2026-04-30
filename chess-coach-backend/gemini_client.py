@@ -1,6 +1,27 @@
 import os
 import json
+import time
+import logging
 from typing import Any, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+_RATE_LIMIT_KEYWORDS = ("429", "rate limit", "quota", "resource exhausted", "resourceexhausted", "too many requests")
+
+def _with_retry(fn, retries: int = 3, base_delay: float = 5.0):
+    """Call fn(), retrying up to `retries` times on Gemini rate-limit errors."""
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as e:
+            err = str(e).lower()
+            is_rate_limit = any(kw in err for kw in _RATE_LIMIT_KEYWORDS)
+            if is_rate_limit and attempt < retries - 1:
+                wait = base_delay * (2 ** attempt)  # 5s, 10s, 20s
+                logger.warning("Gemini rate limit hit, retrying in %.0fs (attempt %d/%d)", wait, attempt + 1, retries)
+                time.sleep(wait)
+            else:
+                raise
 
 try:
     from google import genai  # type: ignore
@@ -109,19 +130,92 @@ Respond ONLY with JSON (no markdown fences, no extra text):
 
     try:
         # Newer google-genai clients accept `config` (not `generation_config`).
-        resp = client.models.generate_content(
+        resp = _with_retry(lambda: client.models.generate_content(
             model=model,
             contents=prompt,
             config={
                 "temperature": float(temperature),
                 "response_mime_type": "application/json",
             },
-        )
+        ))
         text = getattr(resp, "text", None) or getattr(resp, "candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
         content = text or "{}"
         return json.loads(content)
     except Exception as e:
         # Surface as an error so callers can fallback cleanly (no UI leak of raw error text)
+        raise RuntimeError(f"Gemini error: {e}")
+
+
+def analyze_game(move_history: list, model: Optional[str] = None, temperature: float = 0.3) -> Dict[str, Any]:
+    """Analyze a completed game and identify the player's main weakness theme.
+
+    move_history: list of dicts with keys: san, label, cp_delta
+    Returns: { weakness_summary, themes, explanation }
+    """
+    client = get_gemini()
+    model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    # Build a compact move table for the prompt
+    move_lines = []
+    for i, m in enumerate(move_history, 1):
+        move_lines.append(f"  {i}. {m.get('san','?')}  [{m.get('label','?')}]  Δ{m.get('cp_delta', 0):+d} cp")
+    moves_text = "\n".join(move_lines) if move_lines else "  (no moves)"
+
+    prompt = """\
+You are a chess coach reviewing a completed game to identify the player's biggest weakness.
+
+GAME MOVES (player is White; label = Good/Inaccuracy/Mistake/Blunder; Δcp = centipawn change):
+{moves}
+
+AVAILABLE WEAKNESS THEMES (Lichess puzzle tags):
+  mateIn1      - missed forced checkmate in 1 move
+  mateIn2      - missed forced checkmate in 2 moves
+  mateIn3      - missed forced checkmate in 3 moves
+  mateIn4      - missed forced checkmate in 4 moves
+  mateIn5      - missed forced checkmate in 5+ moves
+  fork         - missed opportunities to attack two pieces at once
+  hangingPiece - left pieces undefended or missed capturing free pieces
+  pin          - missed or failed to exploit pins
+  skewer       - missed skewer tactics
+  discoveredAttack - missed discovered attack combinations
+  crushing     - missed winning tactical combinations
+  defensiveMove - failed to find key defensive resources
+
+TASK:
+1. Look at the pattern of mistakes/blunders. What recurring tactical or strategic theme do they suggest?
+2. Pick the 1-2 MOST relevant themes from the list above that best describe the player's gap.
+3. Write a short, encouraging weakness_summary (2-3 sentences) explaining what the player tends to miss.
+4. Write a brief explanation (1-2 sentences) of specific examples from the game.
+
+Respond ONLY with JSON (no markdown fences):
+{{
+  "weakness_summary": "...",
+  "themes": ["theme1", "theme2"],
+  "explanation": "..."
+}}""".format(moves=moves_text)
+
+    try:
+        resp = _with_retry(lambda: client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config={
+                "temperature": float(temperature),
+                "response_mime_type": "application/json",
+            },
+        ))
+        text = getattr(resp, "text", None) or ""
+        result = json.loads(text or "{}")
+        # Validate themes are from our known set
+        known = {
+            "mateIn1","mateIn2","mateIn3","mateIn4","mateIn5",
+            "fork","hangingPiece","pin","skewer",
+            "discoveredAttack","crushing","defensiveMove",
+        }
+        result["themes"] = [t for t in result.get("themes", []) if t in known]
+        if not result["themes"]:
+            result["themes"] = ["crushing"]  # safe default
+        return result
+    except Exception as e:
         raise RuntimeError(f"Gemini error: {e}")
 
 
@@ -143,14 +237,14 @@ def clarify_move(summary_json: Dict[str, Any], question: str, model: Optional[st
     )
 
     try:
-        resp = client.models.generate_content(
+        resp = _with_retry(lambda: client.models.generate_content(
             model=model,
             contents=prompt,
             config={
                 "temperature": float(temperature),
                 "response_mime_type": "text/plain",
             },
-        )
+        ))
         text = getattr(resp, "text", None) or ""
         return text.strip()
     except Exception as e:

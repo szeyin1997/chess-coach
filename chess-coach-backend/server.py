@@ -24,14 +24,16 @@ from helper_functions import (
     humanish_reply,
 )
 try:
-    from gemini_client import summarize_move, clarify_move  # prefer Gemini if available
+    from gemini_client import summarize_move, clarify_move, analyze_game  # prefer Gemini if available
     SUMMARIZER_PROVIDER = "gemini"
 except Exception:  # fallback to OpenAI if Gemini is not importable
     try:
         from openai_client import summarize_move  # no clarify in OpenAI client
         SUMMARIZER_PROVIDER = "openai"
+        analyze_game = None  # type: ignore
     except Exception:
         summarize_move = None  # type: ignore
+        analyze_game = None  # type: ignore
         SUMMARIZER_PROVIDER = None  # type: ignore
 
 # Best-effort check if the selected summarizer is configured (API key + SDK present).
@@ -55,6 +57,15 @@ except Exception:
     SUMMARIZER_CONFIGURED = False
 
 app = FastAPI()
+
+@app.on_event("startup")
+def _warm_puzzle_cache():
+    try:
+        from puzzle_db import _build_cache
+        _build_cache()
+    except Exception as e:
+        logging.warning("Puzzle cache warm-up failed: %s", e)
+
 app.add_middleware(
     CORSMiddleware,
     # Allow common dev origins (localhost and 127.0.0.1)
@@ -68,6 +79,9 @@ app.add_middleware(
 )
 
 ENGINE = open_engine()  # reuse one engine instance
+
+# Accumulates moves for the current game so /analyze-game can review them
+game_history: list[dict] = []
 
 # Simple perf logger setup
 logger = logging.getLogger("chess_coach.perf")
@@ -168,7 +182,8 @@ def hint(body: FenBody):
         if board.is_checkmate(): return {"idea": "Checkmate — no moves left!"}
         if board.is_stalemate(): return {"idea": "Stalemate — it’s a draw."}
         return {"idea": None}
-    return {"idea": san_line(board, lines[0][0])}
+    best_uci = lines[0][0][0].uci() if lines[0][0] else None
+    return {"idea": san_line(board, lines[0][0]), "best_uci": best_uci}
 
 
 
@@ -206,6 +221,9 @@ def play(body: PlayBody):
     _log_duration("play.cp_after_user_black", t)
     delta = after_cp - before_cp
     tag = label_delta(delta)
+
+    # Record this move in the running game history
+    game_history.append({"san": user_san, "label": tag, "cp_delta": delta})
 
     t = time.perf_counter()
     lines_after = best_line(ENGINE, board, plies=4)
@@ -453,5 +471,68 @@ def clarify(body: ClarifyBody):
     try:
         answer = clarify_move(body.summary, body.question)
         return {"ok": True, "answer": answer}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/new-game")
+def new_game():
+    """Reset the server-side game history for a fresh game."""
+    global game_history
+    game_history = []
+    return {"ok": True}
+
+
+class AnalyzeGameBody(BaseModel):
+    moves: list[dict]  # [{san, label, cp_delta}, ...]
+
+
+@app.post("/analyze-game")
+def analyze_game_endpoint(body: AnalyzeGameBody):
+    """Send the completed game move list to Gemini for weakness detection."""
+    if analyze_game is None:
+        return {"ok": False, "error": "Game analysis requires Gemini — not configured"}
+    if not body.moves:
+        return {"ok": False, "error": "No moves provided"}
+    try:
+        result = analyze_game(body.moves)
+        return {"ok": True, **result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class PuzzleRequestBody(BaseModel):
+    themes: list[str]
+    count: int = 5
+
+
+@app.post("/puzzles")
+def get_puzzles(body: PuzzleRequestBody):
+    """Return random puzzles filtered by weakness themes."""
+    try:
+        from puzzle_db import get_puzzles_by_themes, db_stats  # lazy import so missing DB gives a clean error
+    except ImportError:
+        return {"ok": False, "error": "puzzle_db module not found"}
+
+    try:
+        puzzles = get_puzzles_by_themes(
+            themes=body.themes,
+            count=body.count,
+            rating_min=400,
+            rating_max=1100,
+        )
+        return {"ok": True, "puzzles": puzzles}
+    except FileNotFoundError as e:
+        return {"ok": False, "error": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/puzzles/stats")
+def puzzle_stats():
+    """Health check for the puzzle database."""
+    try:
+        from puzzle_db import db_stats
+        return {"ok": True, **db_stats()}
     except Exception as e:
         return {"ok": False, "error": str(e)}
