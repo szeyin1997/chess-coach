@@ -1,73 +1,338 @@
 :root {
-  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
+  --bg:           #161a22;
+  --bg-surface:   #1e2330;
+  --bg-card:      #252c3b;
+  --bg-card-alt:  #2a3245;
+  --border:       #2e3a52;
+  --border-light: #374559;
 
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
+  --text-primary:   #e2e8f4;
+  --text-secondary: #8b97b0;
+  --text-muted:     #56637a;
 
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  --blue:       #4a9eff;
+  --blue-bg:    #0f2a4a;
+  --blue-border:#1e4a82;
+  --green:      #48bb78;
+  --green-bg:   #0d2e1c;
+  --green-border:#1e5c38;
+  --orange:     #ed8936;
+  --orange-bg:  #2e1a08;
+  --orange-border:#6b3a10;
+  --red:        #fc6a6a;
+  --red-bg:     #2e0f0f;
+  --red-border: #6b1f1f;
+  --yellow:     #ecc94b;
+  --yellow-bg:  #2e2408;
+  --yellow-border:#6b5210;
+
+  --radius-sm: 5px;
+  --radius:    8px;
+  --radius-lg: 12px;
+
+  --shadow-sm: 0 1px 3px rgba(0,0,0,.4);
+  --shadow:    0 2px 8px rgba(0,0,0,.5);
+  --shadow-lg: 0 4px 20px rgba(0,0,0,.6);
 }
 
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-a:hover {
-  color: #535bf2;
-}
+*, *::before, *::after { box-sizing: border-box; }
 
-html,
-body,
-#root {
-  height: 100%;
-}
+html, body, #root { height: 100%; }
 
 body {
   margin: 0;
   min-width: 320px;
-  height: 100%;
-  overflow: hidden; /* Disable page scrolling */
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
 }
 
-h1 {
-  font-size: 3.2em;
-  line-height: 1.1;
+a {
+  color: var(--blue);
+  text-decoration: none;
+}
+a:hover { text-decoration: underline; }
+
+h1, h2, h3, h4 {
+  margin: 0;
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
+/* ── Tabs ── */
+.tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 20px;
+}
+.tab-btn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  padding: 10px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: color .15s, border-color .15s;
+  border-radius: 0;
+}
+.tab-btn:hover { color: var(--text-primary); border-color: var(--border-light); }
+.tab-btn.active { color: var(--blue); border-color: var(--blue); }
+.tab-btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+/* ── Buttons ── */
 button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-light);
+  padding: 6px 14px;
+  font-size: 13px;
   font-weight: 500;
   font-family: inherit;
-  background-color: #1a1a1a;
+  background: var(--bg-card);
+  color: var(--text-primary);
   cursor: pointer;
-  transition: border-color 0.25s;
+  transition: background .15s, border-color .15s;
 }
-button:hover {
-  border-color: #646cff;
+button:hover:not(:disabled) { background: var(--bg-card-alt); border-color: var(--blue); }
+button:disabled { opacity: .4; cursor: not-allowed; }
+button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+.btn-primary {
+  background: var(--blue);
+  color: #fff;
+  border-color: var(--blue);
+  font-weight: 600;
 }
-button:focus,
-button:focus-visible {
-  outline: 4px auto -webkit-focus-ring-color;
+.btn-primary:hover:not(:disabled) { background: #3a8eee; border-color: #3a8eee; }
+
+.btn-ghost {
+  background: none;
+  border: none;
+  color: var(--blue);
+  font-weight: 600;
+  padding: 4px 0;
+}
+.btn-ghost:hover:not(:disabled) { background: none; text-decoration: underline; }
+
+/* ── Inputs ── */
+input[type="text"], input[type="search"] {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: inherit;
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color .15s;
+}
+input:focus { border-color: var(--blue); }
+input::placeholder { color: var(--text-muted); }
+
+/* ── Cards ── */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    color: #213547;
-    background-color: #ffffff;
-  }
-  a:hover {
-    color: #747bff;
-  }
-  button {
-    background-color: #f9f9f9;
-  }
+/* ── Badge / label pills ── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .03em;
 }
+.badge-blunder    { background: var(--red-bg);    color: var(--red);    border: 1px solid var(--red-border); }
+.badge-mistake    { background: var(--orange-bg); color: var(--orange); border: 1px solid var(--orange-border); }
+.badge-inaccuracy { background: var(--yellow-bg); color: var(--yellow); border: 1px solid var(--yellow-border); }
+.badge-miss       { background: #0d2e35;           color: #38bcd4;       border: 1px solid #1a5f6e; }
+.badge-good       { background: var(--green-bg);   color: var(--green);  border: 1px solid var(--green-border); }
+
+/* ── Explanation panels ── */
+.explain-why {
+  background: var(--orange-bg);
+  border: 1px solid var(--orange-border);
+  border-radius: var(--radius);
+  padding: 10px 13px;
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.65;
+}
+.explain-better {
+  background: var(--green-bg);
+  border: 1px solid var(--green-border);
+  border-radius: var(--radius);
+  padding: 10px 13px;
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.65;
+}
+.explain-tip {
+  background: var(--blue-bg);
+  border: 1px solid var(--blue-border);
+  border-radius: var(--radius);
+  padding: 10px 13px;
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.65;
+}
+.explain-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  margin-bottom: 5px;
+  opacity: .75;
+}
+
+/* ── Move list (play tab) ── */
+.move-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+}
+.move-row {
+  display: grid;
+  grid-template-columns: 26px 1fr 1fr;
+  align-items: center;
+  gap: 2px;
+  border-radius: var(--radius-sm);
+  padding: 2px 4px;
+}
+.move-row:hover { background: var(--bg-card-alt); }
+.move-num { color: var(--text-muted); font-size: 11px; text-align: right; padding-right: 6px; }
+.move-cell {
+  padding: 3px 7px;
+  border-radius: 4px;
+  font-family: 'SFMono-Regular', 'Consolas', monospace;
+  font-size: 13px;
+  cursor: default;
+}
+.move-cell.blunder    { background: var(--red-bg);    color: var(--red); }
+.move-cell.mistake    { background: var(--orange-bg); color: var(--orange); }
+.move-cell.inaccuracy { background: var(--yellow-bg); color: var(--yellow); }
+.move-cell.miss       { background: #0d2e35;           color: #38bcd4; }
+.move-cell.good       { color: var(--text-primary); }
+
+/* ── Eval bar ── */
+.eval-bar-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+}
+.eval-bar-track {
+  position: relative;
+  flex: 1;
+  height: 8px;
+  background: var(--bg-card);
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.eval-bar-black { position: absolute; left: 0; top: 0; bottom: 0; background: #1f2937; }
+.eval-bar-white { position: absolute; right: 0; top: 0; bottom: 0; background: #f1f5f9; }
+.eval-label { font-size: 11px; color: var(--text-secondary); white-space: nowrap; }
+
+/* ── Scrollable panel ── */
+.scroll-panel {
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-light) transparent;
+}
+.scroll-panel::-webkit-scrollbar { width: 4px; }
+.scroll-panel::-webkit-scrollbar-track { background: transparent; }
+.scroll-panel::-webkit-scrollbar-thumb { background: var(--border-light); border-radius: 2px; }
+
+/* ── Weakness cards ── */
+.weakness-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 14px 16px;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  transition: border-color .15s, background .15s;
+}
+.weakness-card:hover { border-color: var(--blue); background: var(--bg-card-alt); }
+.weakness-freq-bar {
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  margin-top: 10px;
+  overflow: hidden;
+}
+.weakness-freq-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width .4s ease;
+}
+
+/* ── Mistake button (in review list) ── */
+.mistake-btn {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color .12s, background .12s;
+  font-size: 13px;
+}
+.mistake-btn:hover { border-color: var(--blue); background: var(--bg-card-alt); }
+.mistake-btn.active { border-color: var(--blue); background: var(--blue-bg); }
+.mistake-btn.highlighted { border-color: var(--orange-border); background: var(--orange-bg); }
+
+/* ── Spinner ── */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner {
+  width: 20px; height: 20px;
+  border: 2px solid var(--border);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+  display: inline-block;
+}
+
+/* ── Loading state ── */
+.loading-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 48px 0;
+  color: var(--text-secondary);
+}
+.loading-state .chess-icon { font-size: 32px; animation: spin 3s linear infinite; }
+
+/* ── Game header ── */
+.game-header {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 12px 16px;
+  margin-bottom: 14px;
+}
+
+/* ── Result chips ── */
+.result-win  { color: var(--green); }
+.result-loss { color: var(--red); }
+.result-draw { color: var(--text-secondary); }

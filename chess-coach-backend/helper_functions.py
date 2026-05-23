@@ -17,6 +17,7 @@ Notes
 # - It plays back a human-ish reply (still not perfect), so you can keep playing
 
 import sys
+import math
 import random
 import chess
 from typing import Optional
@@ -74,9 +75,27 @@ def eval_cp(engine, board, pov_color, depth: Optional[int] = None):
     return int(score if score is not None else 0)
 
 
-def label_delta(delta_cp):
-    """Map centipawn delta to a friendly label."""
-    # delta_cp = (after - before) from YOUR POV. Negative = got worse.
+_SEVERITY_RANK = {"Good": 0, "Inaccuracy": 1, "Mistake": 2, "Blunder": 3}
+
+
+def win_percent(cp: int) -> float:
+    """Convert centipawns to win probability (0-100), from the player's POV.
+
+    Uses Lichess's sigmoid mapping (slope ~0.00368). Mate scores clamp to 0/100.
+    Why this matters: a 100cp drop from +500 barely changes winning chances
+    (~93%→89%), but a 100cp drop from 0 is huge (50%→41%). Linear cp deltas
+    misjudge both cases; win% handles them naturally.
+    """
+    if cp >= 10000:
+        return 100.0
+    if cp <= -10000:
+        return 0.0
+    return 100.0 / (1.0 + math.exp(-0.00368208 * cp))
+
+
+def _severity_from_cp_delta(delta_cp: int) -> str:
+    """Pure cp-delta severity (positional-context-blind). Catches drastic material
+    losses regardless of whether the player was already winning/losing."""
     a, b, c = BLUNDER_THRESHOLDS  # -50, -100, -300
     if delta_cp >= a:
         return "Good"
@@ -85,6 +104,77 @@ def label_delta(delta_cp):
     if delta_cp >= c:
         return "Mistake"
     return "Blunder"
+
+
+def _severity_from_win_loss(win_loss: float) -> str:
+    """Lichess-style win%-delta severity. Catches 'squandered a winning position'
+    where a small cp drop crosses a key 50%/win threshold."""
+    if win_loss >= 30:
+        return "Blunder"
+    if win_loss >= 20:
+        return "Mistake"
+    if win_loss >= 10:
+        return "Inaccuracy"
+    return "Good"
+
+
+def classify_move(eval_before_cp: int, eval_after_cp: int, best_eval_cp: Optional[int] = None) -> dict:
+    """Single source of truth for move severity, used by every endpoint.
+
+    Combines two methods and TAKES THE WORSE verdict:
+      - cp-delta:  catches drastic material/positional losses regardless of context
+                   (a 300cp drop is at least a Mistake even if you were already winning)
+      - win%-delta: catches squandered-winning-position cases (a 60cp drop that flips
+                   the game from winning to drawing is at least an Inaccuracy)
+
+    Why both: each method has a known failure mode the other covers.
+      - Pure cp-delta over-penalizes drops in already-decided positions.
+      - Pure win%-delta under-classifies cp drops when you're already very losing
+        or very winning (sigmoid saturates, so big cp moves look small in win%).
+
+    All eval values are in centipawns from the player's POV (positive = good for them).
+    """
+    delta_cp   = eval_after_cp - eval_before_cp
+    win_before = win_percent(eval_before_cp)
+    win_after  = win_percent(eval_after_cp)
+    win_loss   = win_before - win_after  # positive = player got worse
+
+    cp_severity   = _severity_from_cp_delta(delta_cp)
+    win_severity  = _severity_from_win_loss(win_loss)
+
+    # Worst-of-both: the move can never be softened by either method alone.
+    severity = max(cp_severity, win_severity, key=lambda s: _SEVERITY_RANK[s])
+    created_problem = severity != "Good"
+
+    missed_opportunity = False
+    win_best = None
+    if best_eval_cp is not None:
+        win_best = win_percent(best_eval_cp)
+        # Best move was clearly winning AND substantially better than what was played.
+        # Both conditions matter: a +20cp engine preference isn't a "missed win".
+        if (win_best - win_after) >= 15 and best_eval_cp >= 100:
+            missed_opportunity = True
+
+    if missed_opportunity and created_problem:
+        label = f"{severity} + Miss"
+    elif missed_opportunity:
+        label = "Miss"
+    else:
+        label = severity
+
+    return {
+        "label": label,
+        "severity": severity,
+        "cp_severity":  cp_severity,
+        "win_severity": win_severity,
+        "missed_opportunity": missed_opportunity,
+        "created_problem": created_problem,
+        "win_before": round(win_before, 1),
+        "win_after":  round(win_after, 1),
+        "win_best":   round(win_best, 1) if win_best is not None else None,
+        "win_loss":   round(win_loss, 1),
+        "cp_delta":   delta_cp,
+    }
 
 
 def best_line(engine, board, depth=ENGINE_DEPTH_ANALYZE, multipv=3, plies=6):

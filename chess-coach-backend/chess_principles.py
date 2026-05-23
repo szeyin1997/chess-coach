@@ -8,6 +8,154 @@
 #                "piece_activity", "tactics", "initiative", "endgame", "opening"
 #   phase      : "opening", "middlegame", "endgame"
 
+from typing import Optional
+
+# ── Tactical pattern library (keyed by motif name) ────────────────────────────
+# These are injected verbatim into the Gemini prompt when a motif is detected
+# by python-chess, so Gemini never has to figure out the pattern itself.
+
+TACTICAL_PATTERNS: dict[str, dict] = {
+    "fork": {
+        "name": "Fork",
+        "description": (
+            "A single piece moves to a square where it simultaneously attacks two or more "
+            "opponent pieces. Since only one piece can move per turn, at least one of the "
+            "attacked pieces will be captured on the next move. Queens, knights, and pawns "
+            "are the most common forking pieces."
+        ),
+    },
+    "pin": {
+        "name": "Pin",
+        "description": (
+            "A piece is attacked along a rank, file, or diagonal and cannot (or should not) "
+            "move because doing so would expose a more valuable piece behind it. An absolute "
+            "pin means the piece is shielding the king and cannot legally move."
+        ),
+    },
+    "skewer": {
+        "name": "Skewer",
+        "description": (
+            "A high-value piece is attacked and forced to move, exposing a lower-value piece "
+            "behind it on the same line — the reverse of a pin. After the front piece moves, "
+            "the piece behind it is captured."
+        ),
+    },
+    "hanging_piece": {
+        "name": "Hanging Piece",
+        "description": (
+            "A piece is left without a defender and can be captured for free on the next move. "
+            "Before completing any move, always verify that every piece you are leaving behind "
+            "has at least one defender."
+        ),
+    },
+    "discovered_attack": {
+        "name": "Discovered Attack",
+        "description": (
+            "Moving one piece unmasks an attack from a piece behind it on the same rank, file, "
+            "or diagonal. The moving piece can simultaneously make its own threat, creating "
+            "two threats at once that are very difficult to meet."
+        ),
+    },
+    "discovered_check": {
+        "name": "Discovered Check",
+        "description": (
+            "A piece moves to reveal a check from a piece behind it. Because the opponent must "
+            "respond to the check, the moving piece can make an additional threat — for example, "
+            "capturing material — that goes unanswered."
+        ),
+    },
+    "double_check": {
+        "name": "Double Check",
+        "description": (
+            "Two pieces deliver check simultaneously as a result of a discovered check. The king "
+            "must move — it cannot block or capture both checking pieces. Double checks are among "
+            "the most forcing and decisive tactics in chess."
+        ),
+    },
+    "back_rank": {
+        "name": "Back Rank Weakness",
+        "description": (
+            "The king is trapped on the back rank by its own pawns and has no escape squares. "
+            "A rook or queen can deliver checkmate or win decisive material by exploiting this. "
+            "Creating a luft (escape square) with h3/g3 or h6/g6 prevents this vulnerability."
+        ),
+    },
+    "trapped_piece": {
+        "name": "Trapped Piece",
+        "description": (
+            "A piece has no safe squares to retreat to and will be captured. This often happens "
+            "when a piece ventures too far into enemy territory without support, or when its "
+            "retreat squares are blocked or controlled by enemy pawns."
+        ),
+    },
+    "deflection": {
+        "name": "Deflection",
+        "description": (
+            "A move forces an opponent's piece away from a key defensive duty — such as guarding "
+            "a piece, a square, or a rank. Once deflected, the target the piece was protecting "
+            "becomes vulnerable to capture or attack."
+        ),
+    },
+    "decoy": {
+        "name": "Decoy / Attraction",
+        "description": (
+            "A sacrifice or forcing move lures an opponent's piece to a specific square where it "
+            "becomes a target for a follow-up tactic. The opponent is forced to accept, then "
+            "falls into the combination."
+        ),
+    },
+    "overloaded": {
+        "name": "Overloaded Piece",
+        "description": (
+            "A single piece is performing two defensive duties simultaneously — for example, "
+            "guarding two pieces or a piece and a key square. Attacking both targets at once "
+            "forces the overloaded piece to abandon one of its duties."
+        ),
+    },
+    "zwischenzug": {
+        "name": "Zwischenzug (In-Between Move)",
+        "description": (
+            "Instead of the expected response (such as recapturing), an intermediate move is "
+            "played first that poses an immediate threat. The opponent must deal with this new "
+            "threat, often changing the result of the subsequent exchange."
+        ),
+    },
+    "x_ray": {
+        "name": "X-Ray Attack",
+        "description": (
+            "A long-range piece (bishop, rook, or queen) exerts pressure through an enemy piece "
+            "to attack a target behind it. The threat remains active even if the front piece "
+            "captures the attacker, because the rear piece recaptures."
+        ),
+    },
+    "back_rank": {
+        "name": "Back Rank Mate",
+        "description": (
+            "The king is trapped on its back rank by its own pawns with no escape squares. "
+            "A queen or rook delivers checkmate along the back rank, often supported by a "
+            "second piece. This is one of the most common mating patterns at club level. "
+            "Creating a 'luft' (escape square) with h3/g3 or h6/g6 prevents it. "
+            "Critically: always scan for back-rank mate threats before making active moves — "
+            "a checkmate threat must be dealt with first, even before winning material."
+        ),
+    },
+    "checkmate_pattern": {
+        "name": "Checkmate Pattern",
+        "description": (
+            "The opponent's move delivers checkmate — the king has no legal moves and is in check. "
+            "The player's move either walked into a mating net or failed to address an "
+            "existing checkmate threat. Always look for the opponent's threats before "
+            "making your own move, especially checks and forcing sequences."
+        ),
+    },
+}
+
+
+def get_tactical_pattern(key: str) -> Optional[dict]:
+    """Return the tactical pattern dict for a given motif key, or None."""
+    return TACTICAL_PATTERNS.get(key)
+
+
 PRINCIPLES = [
     # ── Development ───────────────────────────────────────────────────────────
     {

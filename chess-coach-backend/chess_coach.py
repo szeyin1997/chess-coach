@@ -2,7 +2,7 @@ import chess
 from helper_functions import (
     open_engine,
     eval_cp,
-    label_delta,
+    classify_move,
     best_line,
     san_line,
     humanish_reply,
@@ -50,7 +50,7 @@ def main():
         delta = after_cp - before_cp  # negative = worse for you
 
         # Classify and show a short hint (NOT a full solution)
-        tag = label_delta(delta)
+        tag = classify_move(before_cp, after_cp)["label"]
         print(f"📝 Your move is: {tag} (Δ {delta} cp)")
         # Offer a tiny idea from current position
         lines_after = best_line(engine, board, plies=4)

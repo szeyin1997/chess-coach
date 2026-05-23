@@ -7,6 +7,7 @@ import chess
 import time
 import logging
 import os
+import threading
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -18,7 +19,7 @@ load_dotenv(dotenv_path=_ENV_PATH, override=True)
 from helper_functions import (
     open_engine,
     eval_cp,
-    label_delta,
+    classify_move,
     best_line,
     san_line,
     humanish_reply,
@@ -72,6 +73,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -79,6 +82,7 @@ app.add_middleware(
 )
 
 ENGINE = open_engine()  # reuse one engine instance
+ENGINE_LOCK = threading.Lock()  # Stockfish is not thread-safe — serialize all engine calls
 
 # Accumulates moves for the current game so /analyze-game can review them
 game_history: list[dict] = []
@@ -177,7 +181,8 @@ def levels():
 @app.post("/hint")
 def hint(body: FenBody):
     board = chess.Board(body.fen)
-    lines = best_line(ENGINE, board, plies=4)
+    with ENGINE_LOCK:
+        lines = best_line(ENGINE, board, plies=4)
     if not lines:
         if board.is_checkmate(): return {"idea": "Checkmate — no moves left!"}
         if board.is_stalemate(): return {"idea": "Stalemate — it’s a draw."}
@@ -205,29 +210,49 @@ def play(body: PlayBody):
     if user_move not in board.legal_moves:
         return {"ok": False, "error": "Illegal move"}
 
-    # 1) score user's move (White POV like your CLI)
-    t = time.perf_counter()
-    before_cp = eval_cp(ENGINE, board, chess.WHITE)
-    _log_duration("play.before_cp", t)
+    # Whoever is about to move IS the player. Derive their color so all cp values
+    # passed into classify_move are from THEIR POV (matches /summarize, /import,
+    # /analyze). Hardcoding chess.WHITE here used to invert labels for Black.
+    user_color = board.turn
+
+    # 1) score user's move from their POV
     user_san = board.san(user_move)  # SAN must be before push
+    with ENGINE_LOCK:
+        t = time.perf_counter()
+        before_cp = eval_cp(ENGINE, board, user_color)
+        _log_duration("play.before_cp", t)
+        # Cheap pre-move best line so the label can flag Miss in real time.
+        # depth=4 keeps the added latency tiny (~10 ms).
+        t = time.perf_counter()
+        pre_best = best_line(ENGINE, board, depth=4, multipv=1, plies=1)
+        _log_duration("play.pre_best", t)
+        best_eval_before = pre_best[0][1] if pre_best else None
     board.push(user_move)
-    t = time.perf_counter()
-    after_cp = eval_cp(ENGINE, board, chess.WHITE)
-    _log_duration("play.after_cp", t)
-    # CP after user's move from both POVs
-    cp_after_user_white = after_cp
-    t = time.perf_counter()
-    cp_after_user_black = eval_cp(ENGINE, board, chess.BLACK)
-    _log_duration("play.cp_after_user_black", t)
+    with ENGINE_LOCK:
+        t = time.perf_counter()
+        after_cp = eval_cp(ENGINE, board, user_color)
+        _log_duration("play.after_cp", t)
+        # Keep both white & black POV cp values for the frontend's eval bar.
+        cp_after_user_white = eval_cp(ENGINE, board, chess.WHITE) if user_color == chess.BLACK else after_cp
+        cp_after_user_black = eval_cp(ENGINE, board, chess.BLACK) if user_color == chess.WHITE else after_cp
+        _log_duration("play.cp_after_user_dual", t)
     delta = after_cp - before_cp
-    tag = label_delta(delta)
+    cls = classify_move(before_cp, after_cp, best_eval_before)
+    tag = cls["label"]
 
-    # Record this move in the running game history
-    game_history.append({"san": user_san, "label": tag, "cp_delta": delta})
+    # Record this move in the running game history with full classification.
+    game_history.append({
+        "san": user_san,
+        "label": tag,
+        "severity": cls["severity"],
+        "missed_opportunity": cls["missed_opportunity"],
+        "cp_delta": delta,
+    })
 
-    t = time.perf_counter()
-    lines_after = best_line(ENGINE, board, plies=4)
-    _log_duration("play.idea_pv", t)
+    with ENGINE_LOCK:
+        t = time.perf_counter()
+        lines_after = best_line(ENGINE, board, plies=4)
+        _log_duration("play.idea_pv", t)
     coach_idea = san_line(board, lines_after[0][0]) if lines_after else None
 
     fen_after_user = board.fen()
@@ -247,20 +272,23 @@ def play(body: PlayBody):
         # Optional AI summary only when move is not labeled Good
         if body.summary and summarize_move and (tag != "Good"):
             try:
-                best_lines = best_line(ENGINE, board_before, multipv=1, plies=6)
+                with ENGINE_LOCK:
+                    best_lines = best_line(ENGINE, board_before, multipv=1, plies=6)
                 if best_lines:
                     best_moves = best_lines[0][0]
                     best_move = best_moves[0]
                     best_san = board_before.san(best_move)
                     best_uci = best_move.uci()
-                    tmp_best = board_before.copy(); tmp_best.push(best_move)
-                    best_eval_cp = eval_cp(ENGINE, tmp_best, chess.WHITE)
+                    # Reuse the cheap pre-move best_eval already computed above (player POV).
+                    # Avoids a second engine call AND avoids the chess.WHITE POV bug.
+                    best_eval_cp = best_eval_before if best_eval_before is not None else best_lines[0][1]
                     pv_best_san = san_line(board_before, best_moves)
                 else:
                     best_san = best_uci = pv_best_san = None
                     best_eval_cp = None
 
-                played_line = best_line(ENGINE, chess.Board(fen_after_user), multipv=1, plies=6)
+                with ENGINE_LOCK:
+                    played_line = best_line(ENGINE, chess.Board(fen_after_user), multipv=1, plies=6)
                 pv_played_san = user_san + (" " + san_line(chess.Board(fen_after_user), played_line[0][0]) if played_line else "")
 
                 data = {
@@ -292,24 +320,26 @@ def play(body: PlayBody):
     # Fallback elo if engine lacks Skill Level
     target_elo = SKILL_TO_ELO.get(target_skill) if target_skill is not None else None
 
-    t = time.perf_counter()
-    reply_move, plan = humanish_reply(
-        ENGINE,
-        board,
-        target_elo=target_elo,
-        target_skill=target_skill,
-    )
-    _log_duration("play.reply_select", t)
+    with ENGINE_LOCK:
+        t = time.perf_counter()
+        reply_move, plan = humanish_reply(
+            ENGINE,
+            board,
+            target_elo=target_elo,
+            target_skill=target_skill,
+        )
+        _log_duration("play.reply_select", t)
     reply_san = board.san(reply_move)
     board.push(reply_move)
     fen_after_coach = board.fen()
-    # CP after coach reply from both POVs
-    t = time.perf_counter()
-    cp_after_coach_white = eval_cp(ENGINE, board, chess.WHITE)
-    _log_duration("play.cp_after_coach_white", t)
-    t = time.perf_counter()
-    cp_after_coach_black = eval_cp(ENGINE, board, chess.BLACK)
-    _log_duration("play.cp_after_coach_black", t)
+    # CP after coach reply from both POVs (frontend eval bar needs both).
+    with ENGINE_LOCK:
+        t = time.perf_counter()
+        cp_after_coach_white = eval_cp(ENGINE, board, chess.WHITE)
+        _log_duration("play.cp_after_coach_white", t)
+        t = time.perf_counter()
+        cp_after_coach_black = eval_cp(ENGINE, board, chess.BLACK)
+        _log_duration("play.cp_after_coach_black", t)
 
     resp = {
         "ok": True,
@@ -326,20 +356,23 @@ def play(body: PlayBody):
     # Optional AI summary only when move is not labeled Good
     if body.summary and summarize_move and (tag != "Good"):
         try:
-            best_lines = best_line(ENGINE, board_before, multipv=1, plies=6)
+            with ENGINE_LOCK:
+                best_lines = best_line(ENGINE, board_before, multipv=1, plies=6)
             if best_lines:
                 best_moves = best_lines[0][0]
                 best_move = best_moves[0]
                 best_san = board_before.san(best_move)
                 best_uci = best_move.uci()
-                tmp_best = board_before.copy(); tmp_best.push(best_move)
-                best_eval_cp = eval_cp(ENGINE, tmp_best, chess.WHITE)
+                # Reuse the pre-move best_eval (player POV) computed at the top of /play.
+                # best_lines[0][1] is also from player POV (best_line uses board.turn).
+                best_eval_cp = best_eval_before if best_eval_before is not None else best_lines[0][1]
                 pv_best_san = san_line(board_before, best_moves)
             else:
                 best_san = best_uci = pv_best_san = None
                 best_eval_cp = None
 
-            played_line = best_line(ENGINE, chess.Board(fen_after_user), multipv=1, plies=6)
+            with ENGINE_LOCK:
+                played_line = best_line(ENGINE, chess.Board(fen_after_user), multipv=1, plies=6)
             pv_played_san = user_san + (" " + san_line(chess.Board(fen_after_user), played_line[0][0]) if played_line else "")
 
             data = {
@@ -386,41 +419,54 @@ def summarize(body: SummaryBody):
     if user_move not in board_before.legal_moves:
         return {"ok": False, "error": "Illegal move"}
 
-    # Compute engine data (mirror of /play's summary section)
-    # Use a lighter eval depth for summary speed
-    t = time.perf_counter()
-    before_cp = eval_cp(ENGINE, board_before, chess.WHITE, depth=6)
-    _log_duration("summ.before_cp", t)
-    user_san = board_before.san(user_move)
-    board_after = board_before.copy()
-    board_after.push(user_move)
-    t = time.perf_counter()
-    after_cp = eval_cp(ENGINE, board_after, chess.WHITE, depth=6)
-    _log_duration("summ.after_cp", t)
-    delta = after_cp - before_cp
-    # Prefer the label already computed by /play at full depth to avoid depth mismatch
-    tag = body.label if body.label else label_delta(delta)
+    # The side to move in board_before IS the player about to make this move.
+    # All cp values must be from THEIR POV so classify_move's win% math matches
+    # the rest of the app (evaluate-move, import-chessdotcom).
+    user_color = board_before.turn
 
-    # Use a lighter search for speed when summarizing
-    t = time.perf_counter()
-    best_lines = best_line(ENGINE, board_before, depth=6, multipv=1, plies=4)
-    _log_duration("summ.best_line_pre", t)
-    if best_lines:
-        best_moves = best_lines[0][0]
-        best_move = best_moves[0]
-        best_san = board_before.san(best_move)
-        best_uci = best_move.uci()
-        # Use score from best_line to avoid re-evaluating after best move
-        best_eval_cp = best_lines[0][1]
-        pv_best_san = san_line(board_before, best_moves)
-    else:
-        best_san = best_uci = pv_best_san = None
-        best_eval_cp = None
+    # Compute engine data — serialized via ENGINE_LOCK to prevent race conditions.
+    # Clear the hash table so the best-move answer is deterministic across repeated
+    # /summarize calls for the same position. Without this, transposition entries
+    # from earlier engine calls bias search order and the "best" move can flip
+    # between near-equal candidates at low depth.
+    with ENGINE_LOCK:
+        try:
+            ENGINE.configure({"Clear Hash": True})
+        except Exception:
+            pass  # not all engines expose this option
+        t = time.perf_counter()
+        before_cp = eval_cp(ENGINE, board_before, user_color, depth=19)
+        _log_duration("summ.before_cp", t)
+        user_san = board_before.san(user_move)
+        board_after = board_before.copy()
+        board_after.push(user_move)
+        t = time.perf_counter()
+        after_cp = eval_cp(ENGINE, board_after, user_color, depth=19)
+        _log_duration("summ.after_cp", t)
+        delta = after_cp - before_cp
 
-    t = time.perf_counter()
-    played_line = best_line(ENGINE, board_after, depth=6, multipv=1, plies=4)
-    _log_duration("summ.best_line_post", t)
-    pv_played_san = user_san + (" " + san_line(board_after, played_line[0][0]) if played_line else "")
+        t = time.perf_counter()
+        best_lines = best_line(ENGINE, board_before, depth=19, multipv=1, plies=4)
+        _log_duration("summ.best_line_pre", t)
+        if best_lines:
+            best_moves = best_lines[0][0]
+            best_move = best_moves[0]
+            best_san = board_before.san(best_move)
+            best_uci = best_move.uci()
+            best_eval_cp = best_lines[0][1]
+            pv_best_san = san_line(board_before, best_moves)
+        else:
+            best_san = best_uci = pv_best_san = None
+            best_eval_cp = None
+
+        t = time.perf_counter()
+        played_line = best_line(ENGINE, board_after, depth=19, multipv=1, plies=4)
+        _log_duration("summ.best_line_post", t)
+        pv_played_san = user_san + (" " + san_line(board_after, played_line[0][0]) if played_line else "")
+
+    # Unified classifier — same logic /play and /import-chessdotcom use, but with
+    # best_eval available so we can also flag missed_opportunity.
+    tag = classify_move(before_cp, after_cp, best_eval_cp)["label"]
 
     data = {
         "fen": body.fen,
@@ -501,6 +547,76 @@ def analyze_game_endpoint(body: AnalyzeGameBody):
         return {"ok": False, "error": str(e)}
 
 
+class EvalMoveBody(BaseModel):
+    fen: str
+    uci: str
+
+
+@app.post("/evaluate-move")
+def evaluate_move(body: EvalMoveBody):
+    """Evaluate a single move with Stockfish — fast, no LLM.
+    Returns label, cp_delta, best move, and context needed for /summarize.
+    """
+    try:
+        board = chess.Board(body.fen)
+    except Exception:
+        return {"ok": False, "error": "Bad FEN"}
+
+    user_color = board.turn
+
+    try:
+        move = chess.Move.from_uci(body.uci)
+    except Exception:
+        return {"ok": False, "error": "Bad UCI"}
+
+    if move not in board.legal_moves:
+        return {"ok": False, "error": "Illegal move"}
+
+    user_san = board.san(move)
+
+    with ENGINE_LOCK:
+        before_cp = eval_cp(ENGINE, board, user_color, depth=8)
+        best_lines = best_line(ENGINE, board, depth=8, multipv=1, plies=4)
+
+    best_eval_before = best_lines[0][1] if best_lines else None
+    best_move_obj    = best_lines[0][0][0] if best_lines and best_lines[0][0] else None
+    best_san_str     = board.san(best_move_obj) if best_move_obj else None
+    best_uci_str     = best_move_obj.uci() if best_move_obj else None
+    pv_best_san      = san_line(board, best_lines[0][0]) if best_lines and best_lines[0][0] else None
+
+    board.push(move)
+    fen_after = board.fen()
+
+    with ENGINE_LOCK:
+        after_cp     = eval_cp(ENGINE, board, user_color, depth=8)
+        played_lines = best_line(ENGINE, board, depth=8, multipv=1, plies=4)
+
+    pv_played_san = user_san + (
+        " " + san_line(board, played_lines[0][0]) if played_lines and played_lines[0][0] else ""
+    )
+
+    delta = after_cp - before_cp
+    label = classify_move(before_cp, after_cp, best_eval_before)["label"]
+
+    return {
+        "ok": True,
+        "fen": body.fen,          # FEN before the move — needed by /summarize
+        "san": user_san,
+        "uci": body.uci,
+        "label": label,
+        "cp_delta": round(delta),
+        "best_san": best_san_str,
+        "best_uci": best_uci_str,
+        "best_eval_cp": best_eval_before,
+        "fen_after": fen_after,
+        # Full context so the frontend can call /summarize without another round-trip
+        "eval_before_cp": before_cp,
+        "eval_after_cp": after_cp,
+        "pv_best_san": pv_best_san,
+        "pv_played_san": pv_played_san,
+    }
+
+
 class PuzzleRequestBody(BaseModel):
     themes: list[str]
     count: int = 5
@@ -536,3 +652,407 @@ def puzzle_stats():
         return {"ok": True, **db_stats()}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+class AnalyzeChessDotComBody(BaseModel):
+    username: str
+    count: int = 10
+    time_class: Optional[str] = None  # filter by "rapid", "blitz", "bullet"
+
+
+@app.post("/analyze-chessdotcom")
+def analyze_chessdotcom(body: AnalyzeChessDotComBody):
+    """Fetch the last N Chess.com games, annotate each with Stockfish, and find cross-game weakness patterns."""
+    import chess.pgn
+    import io
+    import urllib.request
+    import json as _json
+    from datetime import datetime
+
+    username = body.username.strip()
+    if not username:
+        return {"ok": False, "error": "Username required"}
+
+    # Fetch enough months to collect `count` games
+    now = datetime.now()
+    all_games = []
+    for delta in range(6):
+        month = now.month - delta
+        year = now.year
+        while month <= 0:
+            month += 12
+            year -= 1
+        url = f"https://api.chess.com/pub/player/{username}/games/{year}/{month:02d}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "chess-coach/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+                month_games = data.get("games", [])
+                if body.time_class:
+                    month_games = [g for g in month_games if g.get("time_class") == body.time_class]
+                all_games = month_games + all_games  # prepend older games so list is chronological
+                if len(all_games) >= body.count:
+                    break
+        except Exception:
+            continue
+
+    if not all_games:
+        return {"ok": False, "error": f"No games found for '{username}'"}
+
+    recent_games = all_games[-body.count:]  # take the most recent N
+
+    annotated_games = []
+    for raw_game in recent_games:
+        pgn_str = raw_game.get("pgn", "")
+        if not pgn_str:
+            continue
+        try:
+            pgn_game = chess.pgn.read_game(io.StringIO(pgn_str))
+        except Exception:
+            continue
+
+        white_username = raw_game.get("white", {}).get("username", "").lower()
+        user_color = chess.WHITE if white_username == username.lower() else chess.BLACK
+
+        # Extract opening from PGN headers
+        opening = pgn_game.headers.get("ECOUrl", "") or pgn_game.headers.get("Opening", "")
+        if "/" in opening:
+            opening = opening.rsplit("/", 1)[-1].replace("-", " ").title()
+
+        board = pgn_game.board()
+        move_history = []
+        move_number = 0
+        with ENGINE_LOCK:
+            prev_cp = eval_cp(ENGINE, board, user_color, depth=6)
+
+        for move in pgn_game.mainline_moves():
+            is_user_move = (board.turn == user_color)
+            san = board.san(move)
+            fen_before = board.fen()
+
+            # Get best-available eval + best move SAN before the user's move
+            # (for Miss detection AND for tactical-context enrichment below).
+            best_eval_before = None
+            best_san_before = None
+            if is_user_move:
+                with ENGINE_LOCK:
+                    bl = best_line(ENGINE, board, depth=4, multipv=1, plies=1)
+                    if bl:
+                        best_eval_before = bl[0][1]
+                        if bl[0][0]:
+                            try:
+                                best_san_before = board.san(bl[0][0][0])
+                            except Exception:
+                                pass
+
+            board.push(move)
+            with ENGINE_LOCK:
+                curr_cp = eval_cp(ENGINE, board, user_color, depth=6)
+
+            if is_user_move:
+                move_number += 1
+                delta = curr_cp - prev_cp
+                cls = classify_move(prev_cp, curr_cp, best_eval_before)
+
+                # For flagged moves, enrich with tactical context (motif, hanging pieces,
+                # opponent's punishment) so the cross-game analyzer sees WHAT went wrong
+                # — not just the bare move name. Without this, the LLM pattern-matches
+                # on the move name (e.g. "O-O" → "king safety") even when the real issue
+                # was a hanging piece.
+                motif = None
+                tactical_summary = None
+                is_flagged = cls["severity"] in ("Mistake", "Blunder") or cls["missed_opportunity"]
+                if is_flagged and best_san_before:
+                    try:
+                        with ENGINE_LOCK:
+                            opp_bl = best_line(ENGINE, board, depth=4, multipv=1, plies=1)
+                        opp_san = None
+                        if opp_bl and opp_bl[0][0]:
+                            try:
+                                opp_san = board.san(opp_bl[0][0][0])
+                            except Exception:
+                                pass
+                        pv_played_san = f"{san} {opp_san}" if opp_san else san
+                        from gemini_client import _compute_chess_facts
+                        facts = _compute_chess_facts(
+                            fen_before=fen_before,
+                            player_san=san,
+                            pv_played_san=pv_played_san,
+                            best_san=best_san_before,
+                        )
+                        motif = facts.get("motif")
+                        # Build a compact one-line summary the cross-game LLM can categorize on.
+                        parts = []
+                        if facts.get("opponent_reply_desc"):
+                            parts.append(f"opponent: {facts['opponent_reply_desc']}")
+                        elif facts.get("hanging_pieces"):
+                            parts.append(f"left hanging: {', '.join(facts['hanging_pieces'][:2])}")
+                        if facts.get("best_move_desc") and facts["best_move_desc"] != best_san_before:
+                            parts.append(f"better: {facts['best_move_desc']}")
+                        tactical_summary = "; ".join(parts) or None
+                    except Exception:
+                        pass  # enrichment is best-effort — don't fail the whole analysis
+
+                move_history.append({
+                    "san": san,
+                    "label": cls["label"],          # composite (may include "+ Miss")
+                    "severity": cls["severity"],    # base label only — for filtering
+                    "missed_opportunity": cls["missed_opportunity"],
+                    "cp_delta": round(delta),
+                    "move_number": move_number,
+                    "fen_before": fen_before,
+                    # Tactical context (only populated for flagged moves — None otherwise).
+                    # Lets analyze_multiple_games categorize WHY a move was bad instead of
+                    # guessing from the move name alone.
+                    "motif": motif,
+                    "tactical_summary": tactical_summary,
+                })
+
+            prev_cp = curr_cp
+
+        white_info = raw_game.get("white", {})
+        black_info = raw_game.get("black", {})
+        user_result = white_info.get("result") if user_color == chess.WHITE else black_info.get("result")
+
+        annotated_games.append({
+            "game_info": {
+                "white": white_info.get("username"),
+                "black": black_info.get("username"),
+                "white_rating": white_info.get("rating"),
+                "black_rating": black_info.get("rating"),
+                "user_color": "white" if user_color == chess.WHITE else "black",
+                "result": user_result,
+                "time_class": raw_game.get("time_class"),
+                "date": (lambda dt: f"{dt.day} {dt.strftime('%b %Y')}")(datetime.fromtimestamp(raw_game["end_time"])) if raw_game.get("end_time") else None,
+                "url": raw_game.get("url"),
+                "opening": opening,
+            },
+            "moves": move_history,
+        })
+
+    if not annotated_games:
+        return {"ok": False, "error": "Could not parse any games"}
+
+    # Compute hard stats from annotated move data.
+    # Use `severity` (base label: Good/Inaccuracy/Mistake/Blunder) for counting —
+    # NOT `label` which may be a composite like "Mistake + Miss" or "Miss".
+    all_moves = [m for g in annotated_games for m in g["moves"]]
+    total = len(all_moves)
+    blunders    = sum(1 for m in all_moves if m.get("severity") == "Blunder")
+    mistakes    = sum(1 for m in all_moves if m.get("severity") == "Mistake")
+    inaccuracies= sum(1 for m in all_moves if m.get("severity") == "Inaccuracy")
+    good_moves  = sum(1 for m in all_moves if m.get("severity") == "Good")
+    # Cap at 1000 cp to exclude mate-detection values (Stockfish reports ~99000 for forced mate)
+    MATE_THRESHOLD = 1000
+    regular_losses = [min(max(0, -m["cp_delta"]), MATE_THRESHOLD) for m in all_moves]
+    avg_cp_loss = round(sum(regular_losses) / total, 1) if total else 0
+    n_games = len(annotated_games)
+
+    def _is_error(m: dict) -> bool:
+        # Any move that hurt the position (Mistake/Blunder) OR missed a clear win.
+        return m.get("severity") in ("Mistake", "Blunder") or m.get("missed_opportunity", False)
+
+    player_stats = {
+        "total_games":       n_games,
+        "total_moves":       total,
+        "blunders":          blunders,
+        "mistakes":          mistakes,
+        "inaccuracies":      inaccuracies,
+        "good_moves":        good_moves,
+        "blunder_rate_pct":  round(blunders / total * 100, 1) if total else 0,
+        "accuracy_pct":      round(good_moves / total * 100, 1) if total else 0,
+        "blunders_per_game": round(blunders / n_games, 1) if n_games else 0,
+        "avg_cp_loss":       avg_cp_loss,
+        # Phase breakdown (approximate by move number)
+        "errors_opening":    sum(1 for m in all_moves if _is_error(m) and m.get("move_number",0) <= 15),
+        "errors_middlegame": sum(1 for m in all_moves if _is_error(m) and 15 < m.get("move_number",0) <= 35),
+        "errors_endgame":    sum(1 for m in all_moves if _is_error(m) and m.get("move_number",0) > 35),
+        # Miss (missed win) is independent of severity — count every move with the flag set.
+        "miss_count":        sum(1 for m in all_moves if m.get("missed_opportunity", False)),
+        "active_blunders":   blunders,
+    }
+
+    # Fetch Chess.com rating for the most common time class played
+    time_class_counts: dict = {}
+    for g in annotated_games:
+        tc = g["game_info"].get("time_class")
+        if tc:
+            time_class_counts[tc] = time_class_counts.get(tc, 0) + 1
+    dominant_tc = max(time_class_counts, key=time_class_counts.get) if time_class_counts else None
+
+    player_rating = None
+    try:
+        stats_url = f"https://api.chess.com/pub/player/{username}/stats"
+        req = urllib.request.Request(stats_url, headers={"User-Agent": "chess-coach/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            stats_data = _json.loads(r.read())
+        tc_key_map = {"rapid": "chess_rapid", "blitz": "chess_blitz", "bullet": "chess_bullet", "daily": "chess_daily"}
+        for tc in ([dominant_tc] if dominant_tc else []) + ["rapid", "blitz", "bullet"]:
+            key = tc_key_map.get(tc, f"chess_{tc}")
+            rating_val = stats_data.get(key, {}).get("last", {}).get("rating")
+            if rating_val:
+                player_rating = rating_val
+                break
+    except Exception:
+        pass  # rating stays None; UI handles gracefully
+
+    # Cross-game weakness analysis via Gemini
+    try:
+        from gemini_client import analyze_multiple_games
+        analysis = analyze_multiple_games(annotated_games)
+    except Exception as e:
+        analysis = {"common_weaknesses": [], "error": str(e)}
+
+    # High-level player summary via Gemini
+    player_summary = None
+    try:
+        from gemini_client import generate_player_summary
+        player_summary = generate_player_summary(
+            games=annotated_games,
+            stats=player_stats,
+            rating=player_rating,
+            time_class=dominant_tc,
+            weaknesses=analysis.get("common_weaknesses", []),
+        )
+    except Exception as e:
+        player_summary = {"error": str(e)}
+
+    return {
+        "ok": True,
+        "games": annotated_games,
+        "player_stats": player_stats,
+        "player_rating": player_rating,
+        "player_time_class": dominant_tc,
+        "player_summary": player_summary,
+        **analysis,
+    }
+
+
+class ImportChessDotComBody(BaseModel):
+    username: str
+    time_class: Optional[str] = None  # "rapid", "blitz", "bullet" — None means any
+
+
+@app.post("/import-chessdotcom")
+def import_chessdotcom(body: ImportChessDotComBody):
+    """Fetch the user's last Chess.com game, annotate with Stockfish, and analyze weaknesses."""
+    import chess.pgn
+    import io
+    import urllib.request
+    import json
+    from datetime import datetime
+
+    username = body.username.strip()
+    if not username:
+        return {"ok": False, "error": "Username required"}
+
+    # Try current month then up to 2 months back to find a game
+    now = datetime.now()
+    games = []
+    for delta in range(3):
+        month = now.month - delta
+        year = now.year
+        while month <= 0:
+            month += 12
+            year -= 1
+        url = f"https://api.chess.com/pub/player/{username}/games/{year}/{month:02d}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "chess-coach/1.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+                month_games = data.get("games", [])
+                if body.time_class:
+                    month_games = [g for g in month_games if g.get("time_class") == body.time_class]
+                if month_games:
+                    games = month_games
+                    break
+        except Exception:
+            continue
+
+    if not games:
+        return {"ok": False, "error": f"No games found for '{username}'"}
+
+    last_game = games[-1]
+    pgn_str = last_game.get("pgn", "")
+    if not pgn_str:
+        return {"ok": False, "error": "Game has no PGN data"}
+
+    try:
+        pgn_game = chess.pgn.read_game(io.StringIO(pgn_str))
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to parse PGN: {e}"}
+
+    # Determine which color the user played
+    white_username = last_game.get("white", {}).get("username", "").lower()
+    user_color = chess.WHITE if white_username == username.lower() else chess.BLACK
+
+    # Annotate each user move with Stockfish
+    board = pgn_game.board()
+    move_history = []
+    move_number = 0
+    with ENGINE_LOCK:
+        prev_cp = eval_cp(ENGINE, board, user_color, depth=8)
+
+    for move in pgn_game.mainline_moves():
+        is_user_move = (board.turn == user_color)
+        san = board.san(move)
+
+        # Get best-available eval before the user's move (for Miss detection).
+        # Cheap shallow lookahead — the per-move label uses depth=8, so depth=4
+        # here is enough to spot "you missed a much better move."
+        best_eval_before = None
+        if is_user_move:
+            with ENGINE_LOCK:
+                bl = best_line(ENGINE, board, depth=4, multipv=1, plies=1)
+                if bl:
+                    best_eval_before = bl[0][1]  # score from user's POV (board.turn == user_color)
+
+        board.push(move)
+        with ENGINE_LOCK:
+            curr_cp = eval_cp(ENGINE, board, user_color, depth=8)
+
+        if is_user_move:
+            move_number += 1
+            delta = curr_cp - prev_cp
+            cls = classify_move(prev_cp, curr_cp, best_eval_before)
+            move_history.append({
+                "san": san,
+                "label": cls["label"],
+                "severity": cls["severity"],                # base label, for filtering
+                "missed_opportunity": cls["missed_opportunity"],
+                "cp_delta": round(delta),
+                "move_number": move_number,
+            })
+
+        prev_cp = curr_cp
+
+    if not move_history:
+        return {"ok": False, "error": "Could not extract moves from game"}
+
+    # Run Gemini weakness analysis
+    analysis = {}
+    if analyze_game is not None:
+        try:
+            analysis = analyze_game(move_history)
+        except Exception as e:
+            analysis = {"error": str(e)}
+
+    white_info = last_game.get("white", {})
+    black_info = last_game.get("black", {})
+    user_result = white_info.get("result") if user_color == chess.WHITE else black_info.get("result")
+
+    return {
+        "ok": True,
+        "moves": move_history,
+        "game_info": {
+            "white": white_info.get("username"),
+            "black": black_info.get("username"),
+            "white_rating": white_info.get("rating"),
+            "black_rating": black_info.get("rating"),
+            "user_color": "white" if user_color == chess.WHITE else "black",
+            "result": user_result,
+            "time_class": last_game.get("time_class"),
+            "url": last_game.get("url"),
+        },
+        **analysis,
+    }
