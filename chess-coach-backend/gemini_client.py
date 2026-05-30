@@ -797,16 +797,33 @@ def _validate_summarize_result(result: Dict[str, Any], ctx: Dict[str, Any]) -> D
     def _ok_concrete(s: str) -> bool:
         return _ok_basic(s) and _has_specifics(s)
 
-    # Three cases for summary:
-    #   1. LLM returned a valid summary → keep it
-    #   2. LLM returned a summary that fails validation → replace with fallback
-    #   3. LLM dropped this item (empty {} padding from len-mismatch) → seed fallback
-    if not result.get('summary'):
+    # --- Enforce the output TYPE contract before content validation. ---
+    # The LLM call sets response_mime_type=json but has NO response_schema, so
+    # field types are NOT guaranteed. The frontend assumes summary:str,
+    # what_next:list[str], if_bad_fix.{missed_idea,best_move,why_best}:str. An
+    # off-shape value (what_next as a string, best_move as an object) would reach
+    # React and throw during render ("map is not a function" / "objects are not
+    # valid as a React child"), blanking the whole page (there is no ErrorBoundary).
+    # Coerce here — the one shared validator — so no endpoint can emit a bad shape.
+    # NOTE: the content helpers (_ok_basic/_ok_concrete) run regex and raise on
+    # non-strings, so every call below is guarded by an isinstance(str) check.
+
+    # summary -> a non-empty, concrete string (else the mechanical fallback).
+    #   Covers: missing/empty summary, dropped {} padding, off-type (dict/list),
+    #   and strings that fail content validation.
+    summary = result.get('summary')
+    if not isinstance(summary, str) or not summary.strip() or not _ok_concrete(summary):
         result['summary'] = fallback
-    elif not _ok_concrete(result['summary']):
-        result['summary'] = fallback
+
+    # if_bad_fix -> a dict of strings, or dropped entirely (the UI optional-chains it).
     fix = result.get('if_bad_fix')
-    if isinstance(fix, dict):
+    if not isinstance(fix, dict):
+        result.pop('if_bad_fix', None)
+    else:
+        # Drop any non-string field so the UI never renders an object as a child.
+        for k in ('missed_idea', 'best_move', 'why_best'):
+            if k in fix and not isinstance(fix[k], str):
+                fix.pop(k, None)
         # Build a more useful missed_idea fallback than just "best_move_desc"
         # (which is a one-liner like "Ng3"). Pair it with the engine's
         # punishment so the user sees both the cost and the alternative.
@@ -817,8 +834,18 @@ def _validate_summarize_result(result: Dict[str, Any], ctx: Dict[str, Any]) -> D
         for k, fb in (("missed_idea", mi_fallback), ("why_best", facts.get('best_move_desc') or best_san)):
             if fix.get(k) and not _ok_concrete(fix[k]):
                 fix[k] = fb
-    if isinstance(result.get('what_next'), list):
-        result['what_next'] = [w for w in result['what_next'] if _ok_basic(w)]
+
+    # what_next -> list[str], each item passing the basic content filter. A bare
+    # string becomes a one-item list; non-string items are dropped.
+    wn = result.get('what_next')
+    if isinstance(wn, str):
+        wn = [wn] if wn.strip() else []
+    elif isinstance(wn, list):
+        wn = [w for w in wn if isinstance(w, str) and w.strip()]
+    else:
+        wn = []
+    result['what_next'] = [w for w in wn if _ok_basic(w)]
+
     return result
 
 
