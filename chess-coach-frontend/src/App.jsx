@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import axios from "axios";
 import { Chess } from "chess.js";
 import { Chessboard } from "react-chessboard";
@@ -8,8 +8,16 @@ const API = "http://127.0.0.1:8000";
 // Bump when the shape of cached analysis data changes (new required fields, etc).
 // Old cached entries from before the bump are treated as a cache miss and re-fetched.
 // History: 1 = pre-classifier-unification (label only); 2 = adds severity + missed_opportunity;
-//          3 = adds motif + tactical_summary per flagged move (cross-game LLM uses these).
-const ANALYSIS_CACHE_VERSION = 3;
+//          3 = adds motif + tactical_summary per flagged move (cross-game LLM uses these);
+//          4 = replaces player_summary.elo_context with player_summary.recommendations (list);
+//          5 = recommendations now distinguish defensive habit-building vs offensive puzzles;
+//          6 = recommendations forbid non-existent puzzle themes, require CCT + sit-on-hands;
+//          7 = adds drill_question per flagged move (Threat Drill tab);
+//          8 = drill_question.correction (phase 2 — what should you have played);
+//          9 = drills now only for blunders and missed wins (mistakes excluded).
+//         10 = adds missed_win flag + "Missed Win" label (missed-mate-still-winning
+//              no longer mislabelled as Blunder; severity drops to the win% arm).
+const ANALYSIS_CACHE_VERSION = 10;
 
 function readAnalysisCache(username) {
   try {
@@ -66,18 +74,19 @@ function moveBadgeClass(label) {
   if (l.includes("blunder"))    return "blunder";
   if (l.includes("mistake"))    return "mistake";
   if (l.includes("inaccuracy")) return "inaccuracy";
-  if (l === "miss")             return "miss";
+  if (l.includes("miss"))       return "miss";   // "Miss" and "Missed Win"
   return "good";
 }
 
 // ── Small reusable components ──────────────────────────────────────────────
 
 function TabBar({ active, onChange }) {
+  const labels = { analyze: "Analyze My Games", drill: "Threat Drill", play: "Play vs Bot" };
   return (
     <div className="tabs">
-      {["analyze","play"].map(tab => (
+      {["analyze","drill","play"].map(tab => (
         <button key={tab} className={`tab-btn${active === tab ? " active" : ""}`} onClick={() => onChange(tab)}>
-          {tab === "analyze" ? "Analyze My Games" : "Play vs Bot"}
+          {labels[tab]}
         </button>
       ))}
     </div>
@@ -187,11 +196,18 @@ function TryModePanel({ result, explaining, explanation, onAnalyze, onNext, onUn
   );
 }
 
-function ExplainPanel({ explanation, bestMove, explaining, posIndex, onAnalyze }) {
+function ExplainPanel({ explanation, bestMove, explaining, posIndex, onAnalyze, batchLoading }) {
   if (explaining) {
     return (
-      <div style={{ display: "flex", alignItems: "center", gap: 10, color: "var(--text-secondary)", fontSize: 13 }}>
-        <span className="spinner" /> Analyzing…
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, color: "var(--text-secondary)", fontSize: 13 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span className="spinner" /> {batchLoading ? "Pre-loading all flagged moves…" : "Analyzing…"}
+        </div>
+        {batchLoading && (
+          <div style={{ fontSize: 11, color: "var(--text-muted)", paddingLeft: 26, lineHeight: 1.5 }}>
+            Coach is analysing every mistake in this game in one pass — first move takes longer, the rest will be instant.
+          </div>
+        )}
       </div>
     );
   }
@@ -294,13 +310,13 @@ function PlayerSummary({ username, data }) {
         </div>
       )}
 
-      {/* Expandable: strengths + Elo context */}
+      {/* Expandable: strengths + recommendations */}
       <button
         className="btn-ghost"
         style={{ marginTop: 10, fontSize: 12, display: "flex", alignItems: "center", gap: 4 }}
         onClick={() => setExpanded(e => !e)}
       >
-        {expanded ? "▲ Hide details" : "▼ Strengths & context"}
+        {expanded ? "▲ Hide details" : "▼ Strengths & recommendations"}
       </button>
 
       {expanded && (
@@ -313,10 +329,12 @@ function PlayerSummary({ username, data }) {
               </ul>
             </div>
           )}
-          {summary.elo_context && (
+          {summary.recommendations?.length > 0 && (
             <div className="explain-tip">
-              <div className="explain-label" style={{ color: "var(--blue)" }}>How you compare at your rating</div>
-              {summary.elo_context}
+              <div className="explain-label" style={{ color: "var(--blue)" }}>Recommendations</div>
+              <ul style={{ margin: "4px 0 0", paddingLeft: 16 }}>
+                {summary.recommendations.map((r, i) => <li key={i} style={{ marginBottom: 3 }}>{r}</li>)}
+              </ul>
             </div>
           )}
           {summary.error && (
@@ -363,6 +381,12 @@ export default function App() {
   const [reviewExplanation, setReviewExplanation] = useState(null);
   const [reviewExplaining, setReviewExplaining] = useState(false);
   const [reviewSelectedMove, setReviewSelectedMove] = useState(null);
+  // Ref mirrors reviewSelectedMove. fetchMistakeExplanation's batch call is async
+  // (can take 30s+); if the user clicks a different flagged move while it's in
+  // flight, we use this ref to know the closure's move is no longer displayed
+  // and skip the setReviewExplanation that would otherwise clobber the new selection.
+  const reviewSelectedMoveRef = useRef(null);
+  useEffect(() => { reviewSelectedMoveRef.current = reviewSelectedMove; }, [reviewSelectedMove]);
 
   // Try-a-move state (game detail review)
   const [tryStack, setTryStack] = useState([]); // [{fen, san, result}] — for undo
@@ -385,6 +409,131 @@ export default function App() {
   const [selectedWeaknessId, setSelectedWeaknessId] = useState(null);
   const [selectedGameIndex, setSelectedGameIndex] = useState(null);
   const [analyzeError, setAnalyzeError] = useState("");
+
+  // Threat Drill state — builds a quiz from flagged moves in multiGameData.
+  // drillIndex points into drillQuestions (computed lazily in the drill branch).
+  // drillPicked = the SAN of the option the user chose; null until they pick.
+  // drillStats tracks self-reported "saw it / missed it" per motif, persisted to
+  // localStorage so progress survives reloads within the same analysis cache.
+  // Two-phase drill state:
+  //   phase 1 ("threat")     — board at fen_after, user picks opponent's best reply
+  //   phase 2 ("correction") — board at fen_before, user picks the move they SHOULD have played
+  // drillThreatPicked / drillCorrectionPicked hold the SAN picked in each phase (null until picked).
+  // drillStats tracks correctness per motif for both phases.
+  const [drillIndex, setDrillIndex] = useState(0);
+  const [drillPhase, setDrillPhase] = useState("threat");
+  const [drillThreatPicked, setDrillThreatPicked] = useState(null);
+  const [drillCorrectionPicked, setDrillCorrectionPicked] = useState(null);
+  const [drillHoveredSan, setDrillHoveredSan] = useState(null);
+  const [drillStats, setDrillStats] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("chess_coach_drill_stats") || "{}"); }
+    catch { return {}; }
+  });
+
+  // LLM-generated threat + correction explanations, keyed by fen_after so each
+  // unique drill question is explained at most once. Cached to localStorage so
+  // we never pay Gemini quota twice for the same position.
+  const [drillExplanations, setDrillExplanations] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("chess_coach_drill_explanations_v4") || "{}"); }
+    catch { return {}; }
+  });
+  const [drillLoadingExplanations, setDrillLoadingExplanations] = useState(false);
+
+  // Per-move "Analyse with Coach" summary cache, keyed by `${fen_before}::${uci}`.
+  // When the user clicks Analyse on any flagged move in a game, we batch-fetch
+  // explanations for EVERY flagged move in that game so subsequent clicks are
+  // instant cache hits. Persists to localStorage across sessions.
+  const [summaryCache, setSummaryCache] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("chess_coach_summaries_v5") || "{}"); }
+    catch { return {}; }
+  });
+  // Track which game's batch is currently in flight (one at a time is fine —
+  // user can only view one game's review at once).
+  const [batchInFlightGame, setBatchInFlightGame] = useState(null);
+
+  // Bridge: when the in-flight batch lands and the user is sitting on a move
+  // whose explanation just landed in the cache, surface it without requiring
+  // another click. Covers the "user clicked B during A's batch" race.
+  // Also realigns the sidebar's bestMove with the explanation's pick so the
+  // two never contradict each other.
+  useEffect(() => {
+    if (!reviewSelectedMove || reviewExplanation) return;
+    const uciSel = deriveUciForMove(reviewSelectedMove);
+    if (!uciSel) return;
+    const hit = summaryCache[summaryCacheKey(reviewSelectedMove.fen_before, uciSel)];
+    if (hit) {
+      setReviewExplanation(hit);
+      setReviewExplaining(false);
+      const derived = bestMoveFromExplanation(hit, reviewSelectedMove.fen_before);
+      if (derived) setReviewBestMove(derived);
+    }
+  }, [summaryCache, reviewSelectedMove, reviewExplanation]);
+
+  // Hoisted so the explanation-loading useEffect can depend on it. The drill
+  // render branch reads the same value.
+  const drillQuestions = useMemo(() => {
+    return (multiGameData?.games || []).flatMap((g, gi) => {
+      const info = g.game_info || {};
+      const userIsWhite = info.user_color === "white";
+      const opponentName = userIsWhite ? info.black : info.white;
+      return (g.moves || [])
+        .filter(m => m.drill_question)
+        .map(m => ({
+          ...m.drill_question,
+          motif: m.motif,
+          gameIndex: gi,
+          moveNumber: m.move_number,
+          userColor: info.user_color || "white",
+          userSan: m.san,
+          fenBeforeUserMove: m.fen_before,
+          severity: m.severity,
+          label: m.label,
+          missedOpportunity: m.missed_opportunity,
+          gameResult: info.result,
+          opponentName,
+          opening: info.opening,
+        }));
+    });
+  }, [multiGameData]);
+
+  // When the Drill tab opens (or new drill questions appear), batch-request
+  // Gemini explanations for any question we haven't already cached. One call
+  // covers all missing items — N drill questions = 1 Gemini call, not N.
+  useEffect(() => {
+    if (activeTab !== "drill") return;
+    if (drillLoadingExplanations) return;
+    if (drillQuestions.length === 0) return;
+    const missing = drillQuestions.filter(q => !drillExplanations[q.fen_after]);
+    if (missing.length === 0) return;
+
+    const items = missing.map(q => ({
+      fen_after: q.fen_after,
+      played_san: q.userSan,
+      opponent_best_san: q.correct_san,
+      correction_fen: q.correction?.fen,
+      correction_best_san: q.correction?.correct_san,
+      motif: q.motif,
+    }));
+
+    setDrillLoadingExplanations(true);
+    axios.post(`${API}/drill/explain-batch`, { items }, { timeout: 120000 })
+      .then(res => {
+        if (res.data?.ok && Array.isArray(res.data.explanations)) {
+          const next = { ...drillExplanations };
+          items.forEach((it, i) => {
+            const e = res.data.explanations[i] || {};
+            // Only store if Gemini actually returned content (skip empty padding)
+            if (e.threat_explanation || e.correction_explanation) {
+              next[it.fen_after] = e;
+            }
+          });
+          setDrillExplanations(next);
+          try { localStorage.setItem("chess_coach_drill_explanations_v4", JSON.stringify(next)); } catch {}
+        }
+      })
+      .catch(() => {})  // best-effort; UI falls back to mechanical correct_desc
+      .finally(() => setDrillLoadingExplanations(false));
+  }, [activeTab, drillQuestions]);
 
   const [chesscomUsername, setChesscomUsername] = useState("snoozydoody");
   const [importingGame, setImportingGame] = useState(false);
@@ -497,8 +646,20 @@ export default function App() {
 
   async function selectMistakeForReview(move, allGameMoves) {
     setReviewMoveNumber(move.move_number);
-    setReviewExplanation(null); setReviewBestMove(null); setReviewPositions([]); setReviewPosIndex(0);
+    setReviewPositions([]); setReviewPosIndex(0);
     setReviewSelectedMove(move);
+    // Seed explanation + bestMove from cache so a previously-batched move loads
+    // instantly on re-click AND the sidebar's best-move matches the explanation
+    // (otherwise /hint at low depth can disagree with the LLM's depth=19 pick).
+    const uciForMove = deriveUciForMove(move);
+    const cached = uciForMove && summaryCache[summaryCacheKey(move.fen_before, uciForMove)];
+    if (cached) {
+      setReviewExplanation(cached);
+      setReviewBestMove(bestMoveFromExplanation(cached, move.fen_before));
+    } else {
+      setReviewExplanation(null);
+      setReviewBestMove(null);
+    }
     // Clear any previous try-mode session
     setTryStack([]); setTryCurrentFen(null); setTryResult(null); setTryExplanation(null); setTryExplaining(false);
 
@@ -548,40 +709,201 @@ export default function App() {
 
     setReviewPositions(positions); setReviewPosIndex(0); setReviewFen(fenBefore);
 
-    // Fetch best-move hint (fast, always useful)
-    try {
-      const hintRes = await axios.post(`${API}/hint`, { fen: fenBefore });
-      if (hintRes.data?.best_uci) {
-        const from = hintRes.data.best_uci.slice(0,2), to = hintRes.data.best_uci.slice(2,4);
-        const NAMES = { p:"Pawn", n:"Knight", b:"Bishop", r:"Rook", q:"Queen", k:"King" };
-        let displayText = `to ${to}`;
-        try { const c = new Chess(fenBefore); const piece = c.get(from); if (piece) displayText = `${NAMES[piece.type]} to ${to}`; } catch {}
-        setReviewBestMove({ from, to, displayText });
-      }
-    } catch {}
+    // Fetch best-move hint (fast). Skipped when we already populated bestMove
+    // from a cached LLM explanation — that's the depth=19 ground truth and
+    // /hint at lower depth could overwrite it with a contradictory pick.
+    if (!cached) {
+      try {
+        const hintRes = await axios.post(`${API}/hint`, { fen: fenBefore });
+        if (hintRes.data?.best_uci) {
+          const from = hintRes.data.best_uci.slice(0,2), to = hintRes.data.best_uci.slice(2,4);
+          const NAMES = { p:"Pawn", n:"Knight", b:"Bishop", r:"Rook", q:"Queen", k:"King" };
+          let displayText = `to ${to}`;
+          try { const c = new Chess(fenBefore); const piece = c.get(from); if (piece) displayText = `${NAMES[piece.type]} to ${to}`; } catch {}
+          setReviewBestMove({ from, to, displayText });
+        }
+      } catch {}
+    }
     // Gemini explanation is NOT triggered here — user clicks "Analyse with Coach"
   }
 
-  async function fetchMistakeExplanation(move) {
-    if (!move?.fen_before) return;
-    let uci = null;
+  // Derive sidebar bestMove ({from, to, displayText}) from a cached LLM
+  // explanation's recommended best move. Uses the same SAN→squares conversion
+  // as the /hint path so both rendering codepaths produce the same shape.
+  // Returns null if the explanation has no best_move or the SAN can't be parsed.
+  function bestMoveFromExplanation(exp, fenBefore) {
+    const bestSan = exp?.if_bad_fix?.best_move;
+    if (!bestSan || !fenBefore) return null;
+    try {
+      const c = new Chess(fenBefore);
+      const match = c.moves({ verbose: true }).find(m =>
+        m.san.replace(/[+#]$/, "") === String(bestSan).replace(/[+#]$/, "")
+      );
+      if (!match) return null;
+      const NAMES = { p:"Pawn", n:"Knight", b:"Bishop", r:"Rook", q:"Queen", k:"King" };
+      return {
+        from: match.from,
+        to: match.to,
+        displayText: `${NAMES[match.piece]} to ${match.to}`,
+      };
+    } catch { return null; }
+  }
+
+  // Derive UCI from a move dict (san + fen_before). Returns null if unparseable.
+  function deriveUciForMove(move) {
+    if (!move?.fen_before || !move?.san) return null;
     try {
       const c = new Chess(move.fen_before);
       const match = c.moves({ verbose: true }).find(m => m.san.replace(/[+#]$/,"") === move.san.replace(/[+#]$/,""));
-      if (match) uci = match.from + match.to + (match.promotion || "");
+      if (match) return match.from + match.to + (match.promotion || "");
     } catch {}
+    return null;
+  }
+
+  // Stable cache key for a single move's coach summary.
+  function summaryCacheKey(fen, uci) { return `${fen}::${uci}`; }
+
+  // Filter a game's moves down to the ones worth analyzing (Mistakes, Blunders,
+  // or missed opportunities — same gate as the per-game drill-down badMoves).
+  function flaggedMovesIn(gameMoves) {
+    return (gameMoves || []).filter(m =>
+      ["Mistake", "Blunder"].includes(m.severity) || m.missed_opportunity
+    );
+  }
+
+  // Cap the batch at this many moves. Larger prompts get truncated or garbled
+  // by Gemini; 12 covers nearly every real game (a 12-flag game is already
+  // catastrophic) while keeping the prompt size predictable.
+  const SUMMARIZE_BATCH_MAX = 12;
+
+  async function fetchMistakeExplanation(move, gameMoves, gameIndex) {
+    if (!move?.fen_before) return;
+    const uci = deriveUciForMove(move);
     if (!uci) { setReviewExplanation({ summary: "Could not derive move notation." }); return; }
+
+    const cacheKey = summaryCacheKey(move.fen_before, uci);
+    // Cache hit — show instantly, no network call
+    if (summaryCache[cacheKey]) {
+      setReviewExplanation(summaryCache[cacheKey]);
+      return;
+    }
+
+    // Skip display updates if the user has navigated to a different move
+    // since we started this call. Cache writes still happen so the work isn't wasted.
+    const isStillSelected = () => reviewSelectedMoveRef.current === move;
+    const safeSetExplanation = (val) => { if (isStillSelected()) setReviewExplanation(val); };
+    const safeSetExplaining  = (val) => { if (isStillSelected()) setReviewExplaining(val); };
+
     setReviewExplaining(true);
+    // If we have the game's full move list, batch ALL flagged moves at once.
+    // First click pays a longer wait; every subsequent click in this game is free.
+    if (gameMoves && gameIndex !== undefined && gameIndex !== null) {
+      const flagged = flaggedMovesIn(gameMoves);
+      // Ensure the clicked move is part of the batch even if it's beyond the cap —
+      // put it first, then fill remaining slots with other flagged moves in order.
+      // Carry the badge-level classification fields through so the backend
+      // can frame the LLM explanation consistently with what the user clicked
+      // (depth=8 badge), instead of reclassifying at depth=19 and producing
+      // "Mistake badge + 'solid choice' verdict" mismatches.
+      const allItems = flagged
+        .map(m => ({
+          fen: m.fen_before,
+          uci: deriveUciForMove(m),
+          label: m.label,
+          severity: m.severity,
+          missed_opportunity: m.missed_opportunity,
+          missed_win: m.missed_win,
+          created_problem: m.severity !== "Good",
+          cp_delta: m.cp_delta,
+          cp_before: m.cp_before,
+          cp_after: m.cp_after,
+          move_number: m.move_number,
+          _isClicked: m === move,
+        }))
+        .filter(it => it.fen && it.uci);
+      const clickedItem = allItems.find(it => it._isClicked);
+      const otherItems = allItems.filter(it => !it._isClicked);
+      const items = (clickedItem ? [clickedItem, ...otherItems] : allItems).slice(0, SUMMARIZE_BATCH_MAX);
+
+      if (items.length >= 2 && batchInFlightGame !== gameIndex) {
+        setBatchInFlightGame(gameIndex);
+        try {
+          const res = await axios.post(`${API}/summarize-batch`,
+            { items: items.map(it => ({
+                fen: it.fen, uci: it.uci, label: it.label,
+                severity: it.severity,
+                missed_opportunity: it.missed_opportunity,
+                missed_win: it.missed_win,
+                created_problem: it.created_problem,
+                cp_delta: it.cp_delta,
+                cp_before: it.cp_before,
+                cp_after: it.cp_after,
+                // Calibrate the coach's advice depth to the player's level.
+                rating: multiGameData?.player_rating ?? null,
+              })) },
+            { timeout: 300000 });
+          if (res.data?.ok && Array.isArray(res.data.summaries)) {
+            const next = { ...summaryCache };
+            // Only write entries that have an actual summary string. An empty
+            // {} comes back when Gemini drops an item (returns fewer analyses
+            // than requested, or SAN-validator strips all text fields). Writing
+            // {} would poison the cache and skip the single-call fallback below.
+            items.forEach((it, i) => {
+              const s = res.data.summaries[i];
+              if (s?.ok && s.ai_summary?.summary) {
+                next[summaryCacheKey(it.fen, it.uci)] = s.ai_summary;
+              }
+            });
+            setSummaryCache(next);
+            try { localStorage.setItem("chess_coach_summaries_v5", JSON.stringify(next)); } catch {}
+            const mine = next[cacheKey];
+            if (mine) {
+              safeSetExplanation(mine);
+              safeSetExplaining(false);
+              // Sync sidebar bestMove with the LLM's pick (depth=19 ground truth)
+              // so it can't disagree with what the explanation says is best.
+              if (reviewSelectedMoveRef.current === move) {
+                const derived = bestMoveFromExplanation(mine, move.fen_before);
+                if (derived) setReviewBestMove(derived);
+              }
+              setBatchInFlightGame(null);
+              return;
+            }
+            // Batch didn't produce content for the clicked move (Gemini dropped
+            // the item, or the move wasn't in `flagged`). Fall through to the
+            // single-call so the user always gets an answer.
+          }
+          // Batch returned ok:false — fall through to single-call below
+        } catch (e) {
+          // Network/timeout — fall through to single-call below
+        } finally {
+          setBatchInFlightGame(null);
+        }
+      }
+    }
+
+    // Fallback: single-move call (when we don't have full game context, or
+    // the batch failed). Same behavior as before.
     try {
-      const sumRes = await axios.post(`${API}/summarize`, { fen: move.fen_before, uci, label: move.label }, { timeout: 60000 });
+      const sumRes = await axios.post(`${API}/summarize`, { fen: move.fen_before, uci, label: move.label, rating: multiGameData?.player_rating ?? null }, { timeout: 60000 });
       if (!sumRes.data?.ok) {
-        setReviewExplanation({ summary: `Analysis error: ${sumRes.data?.error || "unknown"}` });
+        safeSetExplanation({ summary: `Analysis error: ${sumRes.data?.error || "unknown"}` });
       } else {
         const ai = sumRes.data?.ai_summary;
-        setReviewExplanation(ai?.summary ? ai : { summary: "No explanation returned from coach." });
+        if (ai?.summary) {
+          // Cache successful single calls too
+          const next = { ...summaryCache, [cacheKey]: ai };
+          setSummaryCache(next);
+          try { localStorage.setItem("chess_coach_summaries_v5", JSON.stringify(next)); } catch {}
+          if (reviewSelectedMoveRef.current === move) {
+            const derived = bestMoveFromExplanation(ai, move.fen_before);
+            if (derived) setReviewBestMove(derived);
+          }
+        }
+        safeSetExplanation(ai?.summary ? ai : { summary: "No explanation returned from coach." });
       }
-    } catch (e) { setReviewExplanation({ summary: `Request failed: ${e?.message || "unknown error"}` }); }
-    setReviewExplaining(false);
+    } catch (e) { safeSetExplanation({ summary: `Request failed: ${e?.message || "unknown error"}` }); }
+    safeSetExplaining(false);
   }
 
   function resetTryMode() {
@@ -770,7 +1092,7 @@ export default function App() {
             try {
               const sres = await axios.post(`${API}/summarize`, { fen: fenBefore, uci: from+to, ...(promotion?{promotion}:{}), label }, { timeout: 60000 });
               const ai = sres.data?.ai_summary, aiText = ai?.summary || ai?.summary_text;
-              if (aiText) { const v = ai?.verdict ? ` (${ai.verdict})` : ""; setCoach([evalText, `Coach${v}: ${aiText}`].filter(Boolean).join(" · ")); setLastSummary(ai); }
+              if (aiText) { setCoach([evalText, `Coach: ${aiText}`].filter(Boolean).join(" · ")); setLastSummary(ai); }
               else if (sres.data?.error) { setCoach([evalText, idea ? `Idea: ${idea}` : ""].filter(Boolean).join(" · ")); setLastSummary(null); }
             } catch { setCoach([evalText, idea ? `Idea: ${idea}` : ""].filter(Boolean).join(" · ")); setLastSummary(null); }
           })();
@@ -921,6 +1243,360 @@ export default function App() {
     if (piece && piece.color === temp.turn()) { setSelectedSquare(square); return; }
     const ok = await onPieceDrop(selectedSquare, square);
     if (ok) setSelectedSquare(null);
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // THREAT DRILL TAB
+  // ══════════════════════════════════════════════════════════════════════════
+
+  if (activeTab === "drill") {
+    // drillQuestions is hoisted via useMemo above (so the batch-explanations
+    // useEffect can depend on it). Same shape — flat list of drill questions
+    // across all analyzed games, filtered to those with a drill_question.
+    const total = drillQuestions.length;
+    const current = drillQuestions[drillIndex];
+
+    if (total === 0) {
+      return (
+        <div style={{ maxWidth: 720, margin: "0 auto", padding: "20px 16px 60px" }}>
+          <TabBar active={activeTab} onChange={setActiveTab} />
+          <div style={{ textAlign: "center", marginTop: 60, color: "var(--text-secondary)" }}>
+            <h2>Threat Drill</h2>
+            <p style={{ marginTop: 16, lineHeight: 1.6 }}>
+              No drill questions available yet.<br/>
+              Go to <strong>Analyze My Games</strong> first — drill questions are generated
+              from positions where you blundered in real games.
+            </p>
+            <button className="btn-primary" style={{ marginTop: 20 }} onClick={() => setActiveTab("analyze")}>
+              Go to Analyze
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // Resolve a SAN to its from/to squares using chess.js — needed for board
+    // hover preview and post-pick highlighting. Returns null if SAN can't be parsed.
+    function sanToSquares(fen, san) {
+      try {
+        const c = new Chess(fen);
+        const found = c.moves({ verbose: true }).find(m => m.san === san);
+        return found ? { from: found.from, to: found.to, piece: found.piece, color: found.color } : null;
+      } catch { return null; }
+    }
+
+    // Stable shuffle of the 3 options per question, derived from the question's
+    // fen so the order doesn't change between renders. Correct answer is the
+    // first option in the original list; shuffle so it can land anywhere.
+    function shuffleOptions(opts, seed) {
+      let h = 0; for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) | 0;
+      const arr = [...opts];
+      for (let i = arr.length - 1; i > 0; i--) {
+        h = (h * 1103515245 + 12345) & 0x7fffffff;
+        const j = h % (i + 1);
+        [arr[i], arr[j]] = [arr[j], arr[i]];
+      }
+      return arr;
+    }
+
+    // Per-phase data: which board to show, which options to choose between,
+    // which state holds the user's pick, etc. Keeps the render body uniform.
+    const correction = current.correction || null;
+    const isThreatPhase = drillPhase === "threat";
+    const phaseData = isThreatPhase
+      ? {
+          fen: current.fen_after,
+          options: current.options,
+          correctSan: current.correct_san,
+          correctDesc: current.correct_desc,
+          picked: drillThreatPicked,
+          setPicked: setDrillThreatPicked,
+          opponentColor: current.userColor === "white" ? "Black" : "White",
+          // Threat phase always shows the user's last move in purple as context.
+          showUserMoveOverlay: true,
+        }
+      : {
+          fen: correction?.fen,
+          options: correction?.options || [],
+          correctSan: correction?.correct_san,
+          correctDesc: correction?.correct_desc,
+          picked: drillCorrectionPicked,
+          setPicked: setDrillCorrectionPicked,
+          opponentColor: null,  // not used in correction phase
+          // Correction phase = "rewind to before you moved" — don't show the bad move
+          // in purple (would be confusing since user hasn't played anything yet here).
+          showUserMoveOverlay: false,
+        };
+
+    const shuffled = shuffleOptions(phaseData.options, phaseData.fen || "");
+    const isPicked = phaseData.picked !== null;
+    const isCorrect = phaseData.picked === phaseData.correctSan;
+
+    function pickOption(san) {
+      if (phaseData.picked) return;
+      phaseData.setPicked(san);
+      // Record the result for stats. We tally per motif, per phase.
+      const motif = current.motif || "uncategorized";
+      const correct = san === phaseData.correctSan;
+      const next = { ...drillStats };
+      next[motif] = next[motif] || { threats_correct: 0, threats_total: 0, corrections_correct: 0, corrections_total: 0 };
+      if (isThreatPhase) {
+        next[motif].threats_total += 1;
+        if (correct) next[motif].threats_correct += 1;
+      } else {
+        next[motif].corrections_total += 1;
+        if (correct) next[motif].corrections_correct += 1;
+      }
+      setDrillStats(next);
+      try { localStorage.setItem("chess_coach_drill_stats", JSON.stringify(next)); } catch {}
+    }
+
+    function advanceToCorrection() {
+      setDrillPhase("correction");
+      setDrillHoveredSan(null);
+    }
+
+    function nextQuestion() {
+      setDrillPhase("threat");
+      setDrillThreatPicked(null);
+      setDrillCorrectionPicked(null);
+      setDrillHoveredSan(null);
+      setDrillIndex(i => (i + 1) % total);
+    }
+
+    function buildArrows() {
+      const arrows = [];
+      if (isPicked) {
+        const correctSq = sanToSquares(phaseData.fen, phaseData.correctSan);
+        if (correctSq) arrows.push([correctSq.from, correctSq.to, "rgb(34,197,94)"]);
+        if (phaseData.picked !== phaseData.correctSan) {
+          const pickedSq = sanToSquares(phaseData.fen, phaseData.picked);
+          if (pickedSq) arrows.push([pickedSq.from, pickedSq.to, "rgb(239,68,68)"]);
+        }
+      } else if (drillHoveredSan) {
+        const sq = sanToSquares(phaseData.fen, drillHoveredSan);
+        if (sq) arrows.push([sq.from, sq.to, "rgb(59,130,246)"]);
+      }
+      return arrows;
+    }
+
+    function buildSquareStyles() {
+      const styles = {};
+      // Purple context overlay only on the threat board (the user's bad move is
+      // the position-setting move there). Hidden on correction board.
+      if (phaseData.showUserMoveOverlay && current.fenBeforeUserMove && current.userSan) {
+        const userSq = sanToSquares(current.fenBeforeUserMove, current.userSan);
+        if (userSq) {
+          styles[userSq.from] = { background: "rgba(168,85,247,.55)" };
+          styles[userSq.to]   = { background: "rgba(168,85,247,.55)" };
+        }
+      }
+      const sources = [];
+      if (isPicked) {
+        sources.push({ san: phaseData.correctSan, color: "rgba(34,197,94,.55)" });
+        if (phaseData.picked !== phaseData.correctSan) {
+          sources.push({ san: phaseData.picked, color: "rgba(239,68,68,.55)" });
+        }
+      } else if (drillHoveredSan) {
+        sources.push({ san: drillHoveredSan, color: "rgba(59,130,246,.55)" });
+      }
+      for (const s of sources) {
+        const sq = sanToSquares(phaseData.fen, s.san);
+        if (sq) {
+          styles[sq.from] = { background: s.color };
+          styles[sq.to]   = { background: s.color };
+        }
+      }
+      return styles;
+    }
+
+    return (
+      <div style={{ maxWidth: 760, margin: "0 auto", padding: "20px 16px 60px" }}>
+        <TabBar active={activeTab} onChange={setActiveTab} />
+
+        {/* Header */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+          <h2 style={{ margin: 0 }}>Threat Drill</h2>
+          <span style={{ fontSize: 13, color: "var(--text-secondary)" }}>
+            Q{drillIndex + 1} of {total}
+          </span>
+        </div>
+
+        {/* Game / move context — what game, outcome, blunder/miss classification */}
+        {(() => {
+          const r = gameResult(current.gameResult);
+          const labelLower = (current.label || "").toLowerCase();
+          let labelClass = "good";
+          if (labelLower.includes("blunder")) labelClass = "blunder";
+          else if (labelLower.includes("mistake")) labelClass = "mistake";
+          else if (labelLower.includes("inaccuracy")) labelClass = "inaccuracy";
+          else if (labelLower.includes("miss")) labelClass = "miss";
+          return (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 12, fontSize: 12 }}>
+              <span style={{ color: "var(--text-secondary)" }}>
+                <strong>Game {current.gameIndex + 1}</strong> vs <strong>{current.opponentName || "?"}</strong>
+              </span>
+              <span className={r.cls} style={{ fontWeight: 600 }}>{r.label}</span>
+              <span style={{ color: "var(--text-muted)" }}>·</span>
+              <span style={{ color: "var(--text-secondary)" }}>Move <strong>{current.moveNumber}</strong></span>
+              <span className={`badge badge-${labelClass}`}>{current.label || current.severity}</span>
+              {current.motif && (
+                <>
+                  <span style={{ color: "var(--text-muted)" }}>·</span>
+                  <span style={{ color: "var(--text-secondary)", fontFamily: "monospace", fontSize: 11 }}>
+                    {current.motif}
+                  </span>
+                </>
+              )}
+              {current.opening && (
+                <>
+                  <span style={{ color: "var(--text-muted)" }}>·</span>
+                  <span style={{ color: "var(--text-muted)", fontStyle: "italic" }}>{current.opening}</span>
+                </>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* Phase indicator + question prompt */}
+        {isThreatPhase ? (
+          <p style={{ marginTop: 0, marginBottom: 18, fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.6 }}>
+            <span style={{ color: "var(--text-muted)", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginRight: 8 }}>
+              Step 1 of 2 · Threat
+            </span><br/>
+            You played <strong style={{ fontFamily: "monospace" }}>{current.userSan}</strong> <span style={{ color: "var(--text-muted)" }}>(highlighted in purple)</span>.
+            It's {phaseData.opponentColor}'s turn. <strong>What is {phaseData.opponentColor}'s strongest reply?</strong>
+          </p>
+        ) : (
+          <p style={{ marginTop: 0, marginBottom: 18, fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.6 }}>
+            <span style={{ color: "var(--text-muted)", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5, marginRight: 8 }}>
+              Step 2 of 2 · Correction
+            </span><br/>
+            Knowing the opponent threatens <strong style={{ fontFamily: "monospace" }}>{current.correct_san}</strong> ({current.correct_desc}),
+            rewind to before your move. <strong>What should you have played instead of {current.userSan}?</strong>
+          </p>
+        )}
+
+        <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: 24, alignItems: "start" }}>
+          {/* Board */}
+          <div style={{ width: 360 }}>
+            <Chessboard
+              position={phaseData.fen}
+              boardOrientation={current.userColor === "black" ? "black" : "white"}
+              arePiecesDraggable={false}
+              boardWidth={360}
+              customArrows={buildArrows()}
+              customSquareStyles={buildSquareStyles()}
+            />
+          </div>
+
+          {/* Options + reveal */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {shuffled.map((opt, i) => {
+              const picked = phaseData.picked === opt.san;
+              const correct = opt.san === phaseData.correctSan;
+              let bg = "var(--bg-card)", border = "1px solid var(--border-light)", color = "var(--text-primary)";
+              if (isPicked) {
+                if (correct) { bg = "rgba(34,197,94,.15)"; border = "1px solid var(--green)"; }
+                else if (picked) { bg = "rgba(239,68,68,.15)"; border = "1px solid var(--red)"; }
+                else { color = "var(--text-muted)"; }
+              }
+              const sq = sanToSquares(phaseData.fen, opt.san);
+              const pieceLabel = sq ? `${({p:"pawn",n:"knight",b:"bishop",r:"rook",q:"queen",k:"king"})[sq.piece]} ${sq.from}→${sq.to}` : "";
+              return (
+                <button
+                  key={opt.san}
+                  onClick={() => pickOption(opt.san)}
+                  onMouseEnter={() => !isPicked && setDrillHoveredSan(opt.san)}
+                  onMouseLeave={() => !isPicked && setDrillHoveredSan(null)}
+                  disabled={isPicked}
+                  style={{
+                    background: bg, border, color,
+                    padding: "12px 14px", borderRadius: "var(--radius)",
+                    textAlign: "left", fontSize: 14, fontFamily: "monospace",
+                    cursor: isPicked ? "default" : "pointer",
+                    display: "flex", justifyContent: "space-between", alignItems: "center",
+                  }}
+                >
+                  <span>
+                    {String.fromCharCode(65 + i)}.&nbsp; <strong>{opt.san}</strong>
+                    {pieceLabel && (
+                      <span style={{ marginLeft: 8, fontSize: 11, color: "var(--text-muted)", fontFamily: "inherit" }}>
+                        {pieceLabel}
+                      </span>
+                    )}
+                  </span>
+                  {isPicked && (
+                    <span style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                      eval {opt.eval_cp >= 0 ? "+" : ""}{opt.eval_cp} cp
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+
+            {isPicked && (() => {
+              // Prefer Gemini's richer explanation; fall back to the mechanical
+              // python-chess description if the batch call hasn't returned (or
+              // failed). Loading state shows when current question is in flight.
+              const llm = drillExplanations[current.fen_after] || {};
+              const llmText = isThreatPhase ? llm.threat_explanation : llm.correction_explanation;
+              const showLoading = drillLoadingExplanations && !llmText;
+              const explanation = llmText || phaseData.correctDesc;
+              return (
+                <div style={{ marginTop: 8, padding: "12px 14px", background: "var(--bg-card-alt)", borderRadius: "var(--radius)" }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6, color: isCorrect ? "var(--green)" : "var(--orange)" }}>
+                    {isCorrect ? "✓ Correct" : "✗ Best was " + phaseData.correctSan}
+                  </div>
+                  <div style={{ fontSize: 13, lineHeight: 1.5, color: "var(--text-secondary)" }}>
+                    {explanation}
+                    {showLoading && (
+                      <div style={{ marginTop: 6, fontSize: 11, color: "var(--text-muted)", fontStyle: "italic" }}>
+                        Coach is generating a richer explanation…
+                      </div>
+                    )}
+                  </div>
+
+                  <div style={{ marginTop: 14, paddingTop: 12, borderTop: "1px solid var(--border-light)" }}>
+                    {isThreatPhase && correction ? (
+                      <button className="btn-primary" onClick={advanceToCorrection}>
+                        Next: what should you have played? →
+                      </button>
+                    ) : (
+                      <button className="btn-primary" onClick={nextQuestion}>
+                        Next question →
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+
+        {/* Motif stats footer — threat vs correction broken out */}
+        {Object.keys(drillStats).length > 0 && (
+          <div style={{ marginTop: 28, padding: "14px 16px", background: "var(--bg-card)", borderRadius: "var(--radius-lg)" }}>
+            <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 10, fontWeight: 600 }}>YOUR DRILL PROGRESS</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14, fontSize: 12 }}>
+              {Object.entries(drillStats).map(([motif, s]) => {
+                const tt = s.threats_total || 0, tc = s.threats_correct || 0;
+                const ct = s.corrections_total || 0, cc = s.corrections_correct || 0;
+                const tPct = tt > 0 ? Math.round(tc / tt * 100) : null;
+                const cPct = ct > 0 ? Math.round(cc / ct * 100) : null;
+                return (
+                  <div key={motif} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                    <span style={{ fontFamily: "monospace", color: "var(--text-muted)", fontSize: 11 }}>{motif}</span>
+                    {tPct !== null && <span>Threat spotted: <strong>{tPct}%</strong> ({tc}/{tt})</span>}
+                    {cPct !== null && <span>Best move found: <strong>{cPct}%</strong> ({cc}/{ct})</span>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    );
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -1148,9 +1824,10 @@ export default function App() {
                           explanation={reviewExplanation}
                           bestMove={reviewBestMove}
                           explaining={reviewExplaining}
+                          batchLoading={batchInFlightGame === selectedGameIndex}
                           posIndex={reviewPosIndex}
                           onAnalyze={reviewSelectedMove && !reviewExplanation && !reviewExplaining
-                            ? () => fetchMistakeExplanation(reviewSelectedMove)
+                            ? () => fetchMistakeExplanation(reviewSelectedMove, selectedGame?.moves, selectedGameIndex)
                             : null}
                         />
                       )}

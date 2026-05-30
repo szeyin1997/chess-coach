@@ -17,3 +17,4 @@ dist/
 
 # Puzzle database (large binary, generated locally)
 puzzles.db
+.gstack/

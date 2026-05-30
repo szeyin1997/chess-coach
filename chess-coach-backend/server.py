@@ -23,6 +23,8 @@ from helper_functions import (
     best_line,
     san_line,
     humanish_reply,
+    parse_time_control,
+    under_time_pressure,
 )
 try:
     from gemini_client import summarize_move, clarify_move, analyze_game  # prefer Gemini if available
@@ -246,6 +248,7 @@ def play(body: PlayBody):
         "label": tag,
         "severity": cls["severity"],
         "missed_opportunity": cls["missed_opportunity"],
+        "missed_win": cls["missed_win"],
         "cp_delta": delta,
     })
 
@@ -398,6 +401,23 @@ class SummaryBody(BaseModel):
     uci: str                 # user's move in UCI (e2e4, g1f3, e7e8q)
     promotion: Optional[str] = None
     label: Optional[str] = None  # pre-computed label from /play ("Good","Inaccuracy","Mistake","Blunder")
+    # Classification carried forward from the UI's badge (computed by
+    # /analyze-chessdotcom at depth=8). When present, the summarizer uses
+    # these to frame the explanation instead of reclassifying at depth=19 —
+    # which would otherwise produce "Mistake badge + 'solid choice' verdict"
+    # mismatches when depth=19 disagrees with depth=8 on borderline moves.
+    # All optional; single-call /summarize (no badge) keeps reclassifying.
+    severity: Optional[str] = None
+    missed_opportunity: Optional[bool] = None
+    missed_win: Optional[bool] = None
+    created_problem: Optional[bool] = None
+    cp_delta: Optional[int] = None
+    cp_before: Optional[int] = None
+    cp_after: Optional[int] = None
+    # Player rating, when known (review mode forwards it). Calibrates BOTH the
+    # rating-aware move classification AND the coaching advice's depth/vocabulary
+    # (a sub-800 player gets CCT/piece-safety advice, not positional nuance).
+    rating: Optional[int] = None
 
 
 
@@ -466,7 +486,7 @@ def summarize(body: SummaryBody):
 
     # Unified classifier — same logic /play and /import-chessdotcom use, but with
     # best_eval available so we can also flag missed_opportunity.
-    tag = classify_move(before_cp, after_cp, best_eval_cp)["label"]
+    tag = classify_move(before_cp, after_cp, best_eval_cp, rating=body.rating)["label"]
 
     data = {
         "fen": body.fen,
@@ -479,6 +499,7 @@ def summarize(body: SummaryBody):
         "best_eval_cp": best_eval_cp,
         "pv_best_san": pv_best_san,
         "pv_played_san": pv_played_san,
+        "rating": body.rating,
     }
     # Only call the LLM when move is not labeled Good (Inaccuracy/Mistake/Blunder)
     if tag != "Good":
@@ -500,10 +521,143 @@ def summarize(body: SummaryBody):
         return {
             "ok": True,
             "ai_summary": {
-                "verdict": "good",
                 "summary": "Solid move — evaluation did not drop.",
             },
         }
+
+
+def _summarize_engine_data(body: SummaryBody) -> dict:
+    """Run the engine work for one move and assemble the data dict that
+    summarize_move (or summarize_move_batch) expects. Shared between /summarize
+    and /summarize-batch so the engine setup stays identical.
+
+    Returns the data dict, or raises ValueError with a user-facing message.
+    """
+    try:
+        board_before = chess.Board(body.fen)
+    except Exception:
+        raise ValueError("Bad FEN")
+    uci = body.uci if not body.promotion else (body.uci + body.promotion)
+    try:
+        user_move = chess.Move.from_uci(uci)
+    except Exception:
+        raise ValueError("Bad UCI")
+    if user_move not in board_before.legal_moves:
+        raise ValueError("Illegal move")
+
+    user_color = board_before.turn
+    with ENGINE_LOCK:
+        try: ENGINE.configure({"Clear Hash": True})
+        except Exception: pass
+        before_cp = eval_cp(ENGINE, board_before, user_color, depth=19)
+        user_san = board_before.san(user_move)
+        board_after = board_before.copy()
+        board_after.push(user_move)
+        after_cp = eval_cp(ENGINE, board_after, user_color, depth=19)
+        best_lines = best_line(ENGINE, board_before, depth=19, multipv=1, plies=4)
+        if best_lines:
+            best_moves = best_lines[0][0]
+            best_move = best_moves[0]
+            best_san = board_before.san(best_move)
+            best_uci = best_move.uci()
+            best_eval_cp = best_lines[0][1]
+            pv_best_san = san_line(board_before, best_moves)
+        else:
+            best_san = best_uci = pv_best_san = None
+            best_eval_cp = None
+        played_line = best_line(ENGINE, board_after, depth=19, multipv=1, plies=4)
+        pv_played_san = user_san + (" " + san_line(board_after, played_line[0][0]) if played_line else "")
+
+    return {
+        "fen": body.fen,
+        "san": user_san,
+        "uci": uci,
+        "eval_before_cp": before_cp,
+        "eval_after_cp": after_cp,
+        "best_san": best_san,
+        "best_uci": best_uci,
+        "best_eval_cp": best_eval_cp,
+        "pv_best_san": pv_best_san,
+        "pv_played_san": pv_played_san,
+        # Badge-level classification forwarded from the UI. summarize_move_batch
+        # uses these to keep its framing consistent with the badge the user
+        # clicked; absent fields trigger fallback re-classification.
+        "label": body.label,
+        "severity": body.severity,
+        "missed_opportunity": body.missed_opportunity,
+        "missed_win": body.missed_win,
+        "created_problem": body.created_problem,
+        "cp_delta": body.cp_delta,
+        "cp_before": body.cp_before,
+        "cp_after": body.cp_after,
+        "rating": body.rating,
+    }
+
+
+class SummaryBatchBody(BaseModel):
+    items: list[SummaryBody] = []
+
+
+@app.post("/summarize-batch")
+def summarize_batch(body: SummaryBatchBody):
+    """Batch the coach explanation for many flagged moves into ONE Gemini call.
+    Frontend uses this when the user enters a game review — instead of calling
+    /summarize N times (one per click), it pre-loads all flagged moves at once.
+
+    Returns: {ok, summaries: [{ok, ai_summary | error}, ...]} — same length as input.
+    """
+    t_all = time.perf_counter()
+    if not body.items:
+        return {"ok": True, "summaries": []}
+
+    # Run engine work for each item (serialized via ENGINE_LOCK inside the helper).
+    # Items that fail engine setup get a None placeholder — we'll fill in an error
+    # entry at the end so the per-item summary list stays index-aligned with input.
+    data_list = []
+    per_item_errors = []
+    for item in body.items:
+        try:
+            d = _summarize_engine_data(item)
+            # Carry the UI-provided label so summarize_move_batch's classifier
+            # uses the same label the user sees (matches /summarize behavior).
+            data_list.append(d)
+            per_item_errors.append(None)
+        except ValueError as e:
+            data_list.append(None)
+            per_item_errors.append(str(e))
+
+    # Filter to only valid items for the LLM batch. Keep an index map back to original.
+    valid_indices = [i for i, d in enumerate(data_list) if d is not None]
+    valid_data = [data_list[i] for i in valid_indices]
+
+    summaries_by_index: dict = {}
+    if valid_data:
+        if summarize_move is None:
+            for i in valid_indices:
+                summaries_by_index[i] = {"ok": False, "error": "Summarizer not configured"}
+        else:
+            try:
+                from gemini_client import summarize_move_batch
+                ai_list = summarize_move_batch(valid_data)
+                for slot, src in zip(valid_indices, ai_list):
+                    summaries_by_index[slot] = {"ok": True, "ai_summary": src or {}}
+            except Exception as e:
+                err = str(e)
+                for i in valid_indices:
+                    summaries_by_index[i] = {"ok": False, "error": err}
+
+    # Reassemble in original order, filling failed-engine items with their error.
+    out = []
+    for i in range(len(body.items)):
+        if per_item_errors[i] is not None:
+            out.append({"ok": False, "error": per_item_errors[i]})
+        else:
+            out.append(summaries_by_index.get(i, {"ok": False, "error": "Unknown error"}))
+
+    _log_duration("summ_batch.total", t_all)
+    return {"ok": True, "summaries": out}
+
+
 class ClarifyBody(BaseModel):
     summary: dict            # last ai_summary JSON returned by /summarize or /play
     question: str            # user's clarification question
@@ -622,6 +776,28 @@ class PuzzleRequestBody(BaseModel):
     count: int = 5
 
 
+class DrillExplainBatchBody(BaseModel):
+    # Each item carries everything Gemini needs for one drill explanation:
+    # fen_after, played_san, opponent_best_san, correction_fen, correction_best_san, motif.
+    # Caller batches up to ~10 to keep one Gemini call covering many drills.
+    items: list[dict] = []
+
+
+@app.post("/drill/explain-batch")
+def drill_explain_batch(body: DrillExplainBatchBody):
+    """Generate threat + correction explanations for a batch of drill questions.
+    One Gemini call covers all items — saves quota vs one-call-per-question.
+    """
+    if not body.items:
+        return {"ok": True, "explanations": []}
+    try:
+        from gemini_client import explain_drill_batch
+        explanations = explain_drill_batch(body.items)
+        return {"ok": True, "explanations": explanations}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/puzzles")
 def get_puzzles(body: PuzzleRequestBody):
     """Return random puzzles filtered by weakness themes."""
@@ -714,6 +890,12 @@ def analyze_chessdotcom(body: AnalyzeChessDotComBody):
         white_username = raw_game.get("white", {}).get("username", "").lower()
         user_color = chess.WHITE if white_username == username.lower() else chess.BLACK
 
+        # The user's rating in THIS game — feeds rating-aware move classification
+        # (beginner swings judged less harshly than a strong player's). Chess.com's
+        # game JSON carries per-game ratings on white/black.
+        user_rating = (raw_game.get("white", {}) if user_color == chess.WHITE
+                       else raw_game.get("black", {})).get("rating")
+
         # Extract opening from PGN headers
         opening = pgn_game.headers.get("ECOUrl", "") or pgn_game.headers.get("Opening", "")
         if "/" in opening:
@@ -722,10 +904,15 @@ def analyze_chessdotcom(body: AnalyzeChessDotComBody):
         board = pgn_game.board()
         move_history = []
         move_number = 0
+        # Clock context for time-pressure diagnosis (PGN %clk annotations).
+        base_s, inc_s = parse_time_control(pgn_game.headers.get("TimeControl"))
+        prev_user_clock = None  # the user's remaining clock after their PREVIOUS move
         with ENGINE_LOCK:
             prev_cp = eval_cp(ENGINE, board, user_color, depth=6)
 
-        for move in pgn_game.mainline_moves():
+        # Iterate nodes (not bare moves) so node.clock() is available per move.
+        for node in pgn_game.mainline():
+            move = node.move
             is_user_move = (board.turn == user_color)
             san = board.san(move)
             fen_before = board.fen()
@@ -734,16 +921,24 @@ def analyze_chessdotcom(body: AnalyzeChessDotComBody):
             # (for Miss detection AND for tactical-context enrichment below).
             best_eval_before = None
             best_san_before = None
+            pre_move_options = []  # top 3 candidates for the user — feeds the correction quiz
             if is_user_move:
                 with ENGINE_LOCK:
-                    bl = best_line(ENGINE, board, depth=4, multipv=1, plies=1)
-                    if bl:
-                        best_eval_before = bl[0][1]
-                        if bl[0][0]:
-                            try:
-                                best_san_before = board.san(bl[0][0][0])
-                            except Exception:
-                                pass
+                    # multipv=3 so we have 2 distractor candidates for the correction phase
+                    bl = best_line(ENGINE, board, depth=6, multipv=3, plies=1)
+                if bl:
+                    best_eval_before = bl[0][1]
+                    for line_moves, score_cp in bl:
+                        if not line_moves:
+                            continue
+                        try:
+                            pre_move_options.append({
+                                "san": board.san(line_moves[0]),
+                                "eval_cp": int(score_cp),  # user's POV
+                            })
+                        except Exception:
+                            continue
+                    best_san_before = pre_move_options[0]["san"] if pre_move_options else None
 
             board.push(move)
             with ENGINE_LOCK:
@@ -752,7 +947,18 @@ def analyze_chessdotcom(body: AnalyzeChessDotComBody):
             if is_user_move:
                 move_number += 1
                 delta = curr_cp - prev_cp
-                cls = classify_move(prev_cp, curr_cp, best_eval_before)
+                cls = classify_move(prev_cp, curr_cp, best_eval_before, rating=user_rating)
+
+                # Time-pressure context: clock left after this move, time spent on it,
+                # and whether the player was in time pressure. None when no clock data.
+                clock_after = node.clock()
+                tp_flag = under_time_pressure(clock_after, base_s)
+                time_spent = None
+                if clock_after is not None and prev_user_clock is not None:
+                    # spent = (clock before this move) − (clock after) + increment gained
+                    time_spent = max(0.0, prev_user_clock - clock_after + (inc_s or 0))
+                if clock_after is not None:
+                    prev_user_clock = clock_after
 
                 # For flagged moves, enrich with tactical context (motif, hanging pieces,
                 # opponent's punishment) so the cross-game analyzer sees WHAT went wrong
@@ -761,17 +967,30 @@ def analyze_chessdotcom(body: AnalyzeChessDotComBody):
                 # was a hanging piece.
                 motif = None
                 tactical_summary = None
+                drill_question = None
                 is_flagged = cls["severity"] in ("Mistake", "Blunder") or cls["missed_opportunity"]
                 if is_flagged and best_san_before:
                     try:
+                        # Get top 3 opponent replies from position AFTER the user's blunder.
+                        # #1 is the "correct" answer for the drill quiz; #2 and #3 are
+                        # plausible distractors (legitimate moves, just objectively worse).
+                        # This board state is post-user-move, so it's opponent's turn.
+                        fen_after = board.fen()
                         with ENGINE_LOCK:
-                            opp_bl = best_line(ENGINE, board, depth=4, multipv=1, plies=1)
-                        opp_san = None
-                        if opp_bl and opp_bl[0][0]:
+                            opp_top = best_line(ENGINE, board, depth=6, multipv=3, plies=1)
+                        opp_options = []
+                        for line_moves, score_cp in opp_top:
+                            if not line_moves:
+                                continue
                             try:
-                                opp_san = board.san(opp_bl[0][0][0])
+                                opp_options.append({
+                                    "san": board.san(line_moves[0]),
+                                    "eval_cp": int(score_cp),  # opponent's POV
+                                })
                             except Exception:
-                                pass
+                                continue
+
+                        opp_san = opp_options[0]["san"] if opp_options else None
                         pv_played_san = f"{san} {opp_san}" if opp_san else san
                         from gemini_client import _compute_chess_facts
                         facts = _compute_chess_facts(
@@ -790,14 +1009,42 @@ def analyze_chessdotcom(body: AnalyzeChessDotComBody):
                         if facts.get("best_move_desc") and facts["best_move_desc"] != best_san_before:
                             parts.append(f"better: {facts['best_move_desc']}")
                         tactical_summary = "; ".join(parts) or None
+
+                        # Drill question: only emit for genuine blunders or missed wins.
+                        # Mistakes are real but often positional (no clean tactical lesson),
+                        # so they make for muddy drill content. Keep them in motif/tactical
+                        # context for the cross-game analyzer, just skip the quiz.
+                        # Also require ≥2 distinct candidate moves so the multi-choice works.
+                        should_drill = cls["severity"] == "Blunder" or cls["missed_opportunity"]
+                        if should_drill and len(opp_options) >= 2:
+                            # Phase 2: correction question — "knowing the opponent threatens X,
+                            # what should you have played?" Drops the user back into fen_before
+                            # with the same multi-choice UI but for THEIR best move.
+                            correction = None
+                            if len(pre_move_options) >= 2:
+                                correction = {
+                                    "fen": fen_before,
+                                    "options": pre_move_options,
+                                    "correct_san": pre_move_options[0]["san"],
+                                    "correct_desc": facts.get("best_move_desc") or pre_move_options[0]["san"],
+                                }
+                            drill_question = {
+                                "fen_after": fen_after,
+                                "previous_move_san": san,        # what the user played (sets up the position)
+                                "options": opp_options,           # [{san, eval_cp}, ...] — index 0 is correct
+                                "correct_san": opp_options[0]["san"],
+                                "correct_desc": facts.get("opponent_reply_desc") or opp_options[0]["san"],
+                                "correction": correction,         # phase 2 — what you SHOULD have played
+                            }
                     except Exception:
                         pass  # enrichment is best-effort — don't fail the whole analysis
 
                 move_history.append({
                     "san": san,
-                    "label": cls["label"],          # composite (may include "+ Miss")
+                    "label": cls["label"],          # composite (may include "+ Miss") or "Missed Win"
                     "severity": cls["severity"],    # base label only — for filtering
                     "missed_opportunity": cls["missed_opportunity"],
+                    "missed_win": cls["missed_win"],
                     "cp_delta": round(delta),
                     "move_number": move_number,
                     "fen_before": fen_before,
@@ -806,6 +1053,12 @@ def analyze_chessdotcom(body: AnalyzeChessDotComBody):
                     # guessing from the move name alone.
                     "motif": motif,
                     "tactical_summary": tactical_summary,
+                    # Threat-spotter drill question (only flagged moves with ≥2 candidates).
+                    "drill_question": drill_question,
+                    # Time-pressure context (None when the PGN carried no clock data).
+                    "under_time_pressure": tp_flag,
+                    "time_spent_s": round(time_spent, 1) if time_spent is not None else None,
+                    "clock_after_s": round(clock_after, 1) if clock_after is not None else None,
                 })
 
             prev_cp = curr_cp
@@ -852,6 +1105,15 @@ def analyze_chessdotcom(body: AnalyzeChessDotComBody):
         # Any move that hurt the position (Mistake/Blunder) OR missed a clear win.
         return m.get("severity") in ("Mistake", "Blunder") or m.get("missed_opportunity", False)
 
+    # Time-pressure split of serious errors (Mistake/Blunder). Only moves that
+    # carried clock data (under_time_pressure is not None) are counted, so the
+    # split honestly reflects what we can see. This drives the coach's choice
+    # between "manage your clock / play slower" and "train recognition".
+    serious = [m for m in all_moves if m.get("severity") in ("Mistake", "Blunder")]
+    serious_with_clock = [m for m in serious if m.get("under_time_pressure") is not None]
+    errors_time_pressure = sum(1 for m in serious_with_clock if m.get("under_time_pressure"))
+    errors_with_time     = sum(1 for m in serious_with_clock if not m.get("under_time_pressure"))
+
     player_stats = {
         "total_games":       n_games,
         "total_moves":       total,
@@ -870,6 +1132,12 @@ def analyze_chessdotcom(body: AnalyzeChessDotComBody):
         # Miss (missed win) is independent of severity — count every move with the flag set.
         "miss_count":        sum(1 for m in all_moves if m.get("missed_opportunity", False)),
         "active_blunders":   blunders,
+        # Time-pressure diagnosis: of serious errors WITH clock data, how many were
+        # made in time pressure (→ clock/time-control advice) vs with time to spare
+        # (→ recognition / safety-check advice). errors_clock_known = denominator.
+        "errors_time_pressure": errors_time_pressure,
+        "errors_with_time":     errors_with_time,
+        "errors_clock_known":   len(serious_with_clock),
     }
 
     # Fetch Chess.com rating for the most common time class played
@@ -986,14 +1254,21 @@ def import_chessdotcom(body: ImportChessDotComBody):
     white_username = last_game.get("white", {}).get("username", "").lower()
     user_color = chess.WHITE if white_username == username.lower() else chess.BLACK
 
+    # The user's rating in this game — feeds rating-aware move classification.
+    user_rating = (last_game.get("white", {}) if user_color == chess.WHITE
+                   else last_game.get("black", {})).get("rating")
+
     # Annotate each user move with Stockfish
     board = pgn_game.board()
     move_history = []
     move_number = 0
+    base_s, inc_s = parse_time_control(pgn_game.headers.get("TimeControl"))
+    prev_user_clock = None
     with ENGINE_LOCK:
         prev_cp = eval_cp(ENGINE, board, user_color, depth=8)
 
-    for move in pgn_game.mainline_moves():
+    for node in pgn_game.mainline():
+        move = node.move
         is_user_move = (board.turn == user_color)
         san = board.san(move)
 
@@ -1014,14 +1289,25 @@ def import_chessdotcom(body: ImportChessDotComBody):
         if is_user_move:
             move_number += 1
             delta = curr_cp - prev_cp
-            cls = classify_move(prev_cp, curr_cp, best_eval_before)
+            cls = classify_move(prev_cp, curr_cp, best_eval_before, rating=user_rating)
+            clock_after = node.clock()
+            tp_flag = under_time_pressure(clock_after, base_s)
+            time_spent = None
+            if clock_after is not None and prev_user_clock is not None:
+                time_spent = max(0.0, prev_user_clock - clock_after + (inc_s or 0))
+            if clock_after is not None:
+                prev_user_clock = clock_after
             move_history.append({
                 "san": san,
                 "label": cls["label"],
                 "severity": cls["severity"],                # base label, for filtering
                 "missed_opportunity": cls["missed_opportunity"],
+                "missed_win": cls["missed_win"],
                 "cp_delta": round(delta),
                 "move_number": move_number,
+                "under_time_pressure": tp_flag,
+                "time_spent_s": round(time_spent, 1) if time_spent is not None else None,
+                "clock_after_s": round(clock_after, 1) if clock_after is not None else None,
             })
 
         prev_cp = curr_cp

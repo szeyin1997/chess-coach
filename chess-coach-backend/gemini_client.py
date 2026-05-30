@@ -129,6 +129,175 @@ def _with_retry(fn, retries: int = 4, base_delay: float = 2.0):
     raise RuntimeError("Gemini call failed with no recorded exception")
 
 
+_PIECE_NAMES = {
+    "p": "pawn", "n": "knight", "b": "bishop",
+    "r": "rook", "q": "queen", "k": "king",
+}
+
+# SAN regex used by _validate_sans_legal. Only matches notation that is
+# unambiguously a chess MOVE (piece prefix, capture, check/mate, or promotion);
+# pure squares like "e4" in prose like "the pawn on e4" are intentionally
+# ignored so we don't over-reject. See research notes in CLAUDE.md.
+import re as _re
+_SAN_RE = _re.compile(
+    r"\b(?:O-O-O|O-O"
+    r"|[KQRBN][a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?"
+    r"|[a-h][1-8]?x[a-h][1-8](?:=[QRBN])?[+#]?"
+    r"|[a-h][1-8]=[QRBN][+#]?"
+    r"|[a-h][1-8][+#])\b"
+)
+
+
+def _legal_sans(fen: str) -> list:
+    """Every legal move in the position as SAN. Feeding this list to the LLM
+    bounds its move universe — it cannot cite a move that isn't on this list."""
+    import chess as _chess
+    try:
+        b = _chess.Board(fen)
+        return sorted(b.san(m) for m in b.legal_moves)
+    except Exception:
+        return []
+
+
+def _current_attacks(fen: str) -> list:
+    """List every existing attack relationship in the position. Pre-loading this
+    prevents the LLM from inventing attack relationships that don't exist."""
+    import chess as _chess
+    NAMES = {
+        _chess.PAWN: "pawn", _chess.KNIGHT: "knight", _chess.BISHOP: "bishop",
+        _chess.ROOK: "rook", _chess.QUEEN: "queen", _chess.KING: "king",
+    }
+    try:
+        b = _chess.Board(fen)
+    except Exception:
+        return []
+    out = []
+    for sq in _chess.SQUARES:
+        target = b.piece_at(sq)
+        if not target:
+            continue
+        attackers = list(b.attackers(not target.color, sq))
+        if not attackers:
+            continue
+        t_color = "White" if target.color == _chess.WHITE else "Black"
+        a_color = "Black" if target.color == _chess.WHITE else "White"
+        atk_descs = ", ".join(
+            f"{NAMES[b.piece_at(a).piece_type]} on {_chess.square_name(a)}"
+            for a in attackers
+        )
+        defenders = list(b.attackers(target.color, sq))
+        def_descs = ", ".join(
+            f"{NAMES[b.piece_at(d).piece_type]} on {_chess.square_name(d)}"
+            for d in defenders
+        ) or "undefended"
+        out.append(
+            f"{a_color}'s {atk_descs} attacks {t_color}'s {NAMES[target.piece_type]} "
+            f"on {_chess.square_name(sq)} (defenders: {def_descs})"
+        )
+    return out
+
+
+# Hand-wave phrases that the LLM has historically used to dodge the
+# "name the piece + square" requirement. Each is forbidden on its own;
+# _is_vague returns True (text is vague) when any pattern matches.
+# Keep narrow — we want to catch lazy paraphrase, not legitimate prose.
+_VAGUE_PATTERNS = [
+    _re.compile(p, _re.IGNORECASE) for p in (
+        # Quantifier hand-waves
+        r"\bmultiple pieces\b",
+        r"\bseveral pieces\b",
+        r"\bimportant pieces\b",
+        r"\bkey pieces\b",
+        r"\bmultiple threats\b",
+        r"\bcreate[sd]? (?:a |multiple |several )?threats?\b",
+        # "captures your <piece>" without nearby square notation. Matches when
+        # there's NO algebraic square within the next ~6 words.
+        r"\bcaptur(?:e|es|ing) (?:your |the |a )?(?:pawn|knight|bishop|rook|queen)\b(?![^.]{0,40}\b[a-h][1-8]\b)",
+        # "attacks your <piece>" without nearby square
+        r"\battack(?:s|ing)? (?:your |the |a )?(?:pawn|knight|bishop|rook|queen|king)\b(?![^.]{0,40}\b[a-h][1-8]\b)",
+        # "forks <pieces>" without naming squares — covers singular nouns
+        r"\bfork(?:s|ed|ing)? (?:your |the )?(?:pawn|knight|bishop|rook|queen|king)\b(?![^.]{0,60}\b[a-h][1-8]\b)",
+        # "forking your pieces" / "fork the pieces" — plural collective without naming any
+        r"\bfork(?:s|ed|ing)? (?:your |the |both )?pieces\b",
+        # "devastating/dangerous fork" + no square nearby
+        r"\b(?:devastating|dangerous|strong|crushing) (?:fork|attack|threat)\b(?![^.]{0,60}\b[a-h][1-8]\b)",
+    )
+]
+
+
+def _is_vague(text: str) -> bool:
+    """Return True if the LLM output uses hand-wave phrasing that the prompt
+    explicitly forbids. Catches paraphrases that the SAN validator can't see
+    because they don't cite a specific (illegal) move — e.g. 'captures your
+    bishop and creates a devastating fork on multiple pieces' has no SAN at
+    all but is still a violation."""
+    if not text:
+        return False
+    for pat in _VAGUE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            logger.warning("rejecting vague LLM output: %r matched %r", m.group(0), pat.pattern)
+            return True
+    return False
+
+
+_SQUARE_RE = _re.compile(r"\b[a-h][1-8]\b")
+
+
+def _has_specifics(text: str) -> bool:
+    """Return True if the text has ≥2 distinct concrete references — squares
+    (e4, h8) or SAN moves (Nf3, Bxe7). One reference isn't enough: a sentence
+    like 'Your move Be2 was a blunder, significantly worsening your position'
+    technically cites Be2, but only restates what the user already sees on
+    the badge — no actual content about what happens or what to play instead.
+
+    Two references typically means: the played move + the engine's reply, or
+    a piece + the square it sits on, or the played move + the punishment
+    square. All useful explanations have at least two."""
+    if not text:
+        return False
+    tokens = set(_SQUARE_RE.findall(text))
+    tokens.update(_SAN_RE.findall(text))
+    return len(tokens) >= 2
+
+
+def _validate_sans_legal(text: str, fens: list) -> bool:
+    """Scan text for chess-move-shaped tokens; return False if any token is
+    NOT legal in at least one of the supplied FENs. Used as a post-hoc filter
+    to catch LLM hallucinations like 'White pawn captures Black bishop on e7'
+    when no pawn move can reach e7 in the actual position.
+
+    Permissive by design: ambiguity (no FENs supplied, regex finds nothing,
+    or token is legal in any provided FEN) returns True so we don't over-reject."""
+    import chess as _chess
+    tokens = _SAN_RE.findall(text or "")
+    if not tokens:
+        return True
+    boards = []
+    for f in fens:
+        if not f:
+            continue
+        try:
+            boards.append(_chess.Board(f))
+        except Exception:
+            pass
+    if not boards:
+        return True
+    for tok in tokens:
+        ok = False
+        for b in boards:
+            try:
+                b.parse_san(tok)
+                ok = True
+                break
+            except Exception:
+                continue
+        if not ok:
+            logger.warning("rejecting LLM output citing illegal SAN %r", tok)
+            return False
+    return True
+
+
 def _compute_chess_facts(fen_before: str, player_san: str, pv_played_san: str, best_san: str) -> dict:
     """Use python-chess to derive verified facts about a move. No LLM involved."""
     import chess as _chess
@@ -324,9 +493,15 @@ def _compute_chess_facts(fen_before: str, player_san: str, pv_played_san: str, b
                 elif direct_capture_desc:
                     motif = "hanging_piece"
 
+                # When the reply creates no concrete tactic, state that plainly —
+                # don't invent a value judgment. The old fallback ("seizes a strong
+                # position") asserted opponent strength with zero engine basis and
+                # was often flatly wrong (e.g. a quiet move while the opponent is
+                # still losing by a piece). A quiet move is a verified fact: we
+                # checked captures/checks/forks/pins/discoveries and found none.
                 opponent_reply_desc = (
                     f"{opponent_reply_san} " + " and ".join(effects)
-                    if effects else f"{opponent_reply_san} seizes a strong position"
+                    if effects else f"{opponent_reply_san} is a quiet move with no immediate tactic"
                 )
             except Exception:
                 opponent_reply_desc = opponent_reply_san
@@ -363,66 +538,164 @@ def _compute_chess_facts(fen_before: str, player_san: str, pv_played_san: str, b
     }
 
 
-def summarize_move(data: Dict[str, Any], model: Optional[str] = None, temperature: float = 0.4) -> Dict[str, Any]:
-    """Call Gemini to explain a move.
+def summarize_move(data: Dict[str, Any], model: Optional[str] = None, temperature: float = 0.15) -> Dict[str, Any]:
+    """Explain a single move.
 
-    All chess facts (hanging pieces, opponent reply, captures) are pre-computed
-    by python-chess. Gemini is only asked to explain the principle and coach.
+    Thin wrapper over summarize_move_batch so the SINGLE and BATCH paths share
+    ONE prompt, ONE rule set, ONE schema, and ONE validator. These used to be
+    two hand-maintained prompt strings that drifted: the batch version grew
+    stricter anti-hand-wave rules and BAD/GOOD examples that the single version
+    never got, so the same move read differently depending on which endpoint
+    produced it. See CLAUDE.md "no band-aids" — unify, don't duplicate.
+
+    All chess facts (hanging pieces, opponent reply, captures) are still
+    pre-computed by python-chess; Gemini only verbalizes them.
     """
-    model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    results = summarize_move_batch([data], model=model, temperature=temperature)
+    return results[0] if results else {}
 
+
+def _level_guidance(rating: Optional[int]) -> str:
+    """Coaching-level calibration for the explanation prompt, by player rating.
+
+    Research basis (see RESEARCH.md): sub-800 players improve most from piece
+    safety and simple one-move tactics — NOT positional nuance, opening theory, or
+    deep endgame technique, which are noise at their level. Advice pitched above
+    the player just doesn't land. We therefore tell the LLM how deep to pitch
+    EVERY advice field.
+
+    On CCT: a full Checks/Captures/Threats scan EVERY move is too slow for a
+    beginner in real games — they flag (run out of time) or abandon it. So the
+    beginner habit we teach is the cheap version — Heisman's one-question safety
+    check on the move they've ALREADY chosen ("after this move, can my opponent
+    take something of mine for free, or hit me with a check/threat I can't meet?")
+    — plus playing slower time controls so there's time to ask it. Reserve the
+    full board scan for improvers+, where it's affordable.
+
+    rating=None returns "" (generic advice, unchanged behavior)."""
+    if rating is None:
+        return ""
+    if rating < 800:
+        return (
+            "PLAYER LEVEL: beginner (rating ~{r}). Pitch ALL advice to this level:\n"
+            "    - The core habit is a FAST safety check on the move they already want to "
+            "play — not a slow scan of the whole board. Frame it as one question: 'After "
+            "this move, can my opponent capture something of mine for free, or give a check "
+            "or threat I can't answer?' This takes a couple of seconds on ONE move.\n"
+            "    - If time pressure is the real issue, it's fine to advise playing slower "
+            "time controls (Rapid 10-15+ min, not Blitz) so there's time for that check.\n"
+            "    - Most losses here are from not noticing a piece was hanging or a threat "
+            "was coming, NOT from bad calculation. Keep tactics to ONE move.\n"
+            "    - AVOID opening theory, long-term positional concepts (prophylaxis, weak "
+            "squares, the bishop pair) and deep endgame technique — they don't help at this level.\n"
+            "    - Plain language; if you use a chess term, explain it in a few words.\n"
+            "    - Do NOT tell the player to 'scan every check, capture and threat on every "
+            "move' — that's too slow for a real game and they won't do it."
+        ).format(r=rating)
+    if rating < 1400:
+        return (
+            "PLAYER LEVEL: improver (rating ~{r}). Pitch advice to this level:\n"
+            "    - Two-move tactics and short calculation, basic plans, piece activity and "
+            "simple endgames are fair game.\n"
+            "    - Reinforce a safety check on candidate moves (can the opponent reply with "
+            "a check/capture/threat you can't meet?) — the biggest leak here. A full CCT "
+            "board scan is affordable now, especially on forcing or sharp positions.\n"
+            "    - Light positional ideas are fine; avoid advanced strategy and deep theory."
+        ).format(r=rating)
+    return (
+        "PLAYER LEVEL: intermediate+ (rating ~{r}). You may use positional concepts "
+        "(prophylaxis, weak squares, pawn structure, the bishop pair), deeper calculation "
+        "and endgame technique, and assume standard chess vocabulary."
+    ).format(r=rating)
+
+
+def _summarize_item_block(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the per-item prompt section + return validation context for one move.
+
+    Returns a dict with:
+      - section: the verified-facts block to splice into a prompt
+      - fens: list of FENs to validate against (for post-hoc SAN check)
+      - facts: the _compute_chess_facts result (used for fallbacks)
+      - best_san: the engine's best move
+      - fallback_summary: mechanical sentence used when LLM output is rejected
+      - classification: classify_move's full dict
+    """
     from helper_functions import classify_move
+    import chess as _chess
 
     eval_before = data.get('eval_before_cp', 0) or 0
     eval_after  = data.get('eval_after_cp',  0) or 0
     best_eval   = data.get('best_eval_cp')
-    delta_cp    = eval_after - eval_before  # cp delta from player's POV
+    delta_cp    = eval_after - eval_before
 
-    # Single source of truth — same unified classifier every endpoint uses.
-    classification = classify_move(eval_before, eval_after, best_eval)
+    # Compute classification at this endpoint's depth (19) — needed for win %
+    # display fallback. We then override the framing-driving fields with the
+    # UI's badge-level classification (depth=8 from /analyze-chessdotcom) when
+    # the frontend supplied them, so the FRAMING the LLM explains matches the
+    # badge the user clicked. (The LLM no longer emits its own verdict — the
+    # engine severity badge is the sole judgment.) See CLAUDE.md "no label_delta".
+    classification = classify_move(eval_before, eval_after, best_eval, rating=data.get('rating'))
+    ui_severity = data.get('severity')
+    if ui_severity is not None:
+        classification['label']              = data.get('label') or ui_severity
+        classification['severity']           = ui_severity
+        classification['missed_opportunity'] = bool(data.get('missed_opportunity'))
+        classification['missed_win']         = bool(data.get('missed_win'))
+        # If UI didn't tell us created_problem explicitly, infer from severity:
+        # anything worse than Good created a problem unless it was a pure Miss.
+        if data.get('created_problem') is not None:
+            classification['created_problem'] = bool(data['created_problem'])
+        else:
+            classification['created_problem'] = ui_severity != 'Good'
 
-    # Severity string given to Gemini. Includes both cp and win% so Gemini can
-    # use whichever framing makes more sense for the position (drastic material
-    # loss vs. squandered winning chances).
+    # Display values: prefer the UI's cp_delta and cp_before/cp_after if
+    # provided so the severity line shown to the LLM matches what the badge
+    # was computed from. Falls back to depth=19 numbers otherwise.
+    display_delta = data.get('cp_delta') if data.get('cp_delta') is not None else int(delta_cp)
+    if data.get('cp_before') is not None and data.get('cp_after') is not None:
+        try:
+            from helper_functions import win_percent
+            win_b = win_percent(int(data['cp_before']))
+            win_a = win_percent(int(data['cp_after']))
+        except Exception:
+            win_b, win_a = classification['win_before'], classification['win_after']
+    else:
+        win_b, win_a = classification['win_before'], classification['win_after']
+
     severity = "{lbl} (cp delta {dcp:+d}; winning chance {wb:.0f}% → {wa:.0f}%)".format(
         lbl=classification["label"],
-        dcp=int(delta_cp),
-        wb=classification["win_before"],
-        wa=classification["win_after"],
+        dcp=int(display_delta),
+        wb=win_b,
+        wa=win_a,
     )
 
-    # Frame the explanation based on which signal(s) fired. Because classify_move
-    # now takes the WORSE of cp-delta and win%-delta, created_problem fires whenever
-    # the move actually worsened the position — including drastic cp drops in
-    # already-losing positions (the bug that made /summarize say "good move" on
-    # a Mistake). missed_opportunity is orthogonal — a clearly better move existed.
-    if classification["missed_opportunity"] and classification["created_problem"]:
+    if classification.get("missed_win"):
+        framing = (
+            "FRAMING: This is a MISSED WIN — a forced or clearly winning line was "
+            "available and the player declined it, but they are STILL clearly winning. "
+            "Lead with the win they missed and the exact line that wins. Do NOT say the "
+            "opponent gained anything, 'seized' a position, or that the player's chances "
+            "collapsed — they did not. The point is the faster/forced win that was on the "
+            "board, not damage done."
+        )
+    elif classification["missed_opportunity"] and classification["created_problem"]:
         framing = (
             "FRAMING: This move BOTH missed a winning opportunity AND worsened the position. "
-            "Lead with the missed idea (what they could have done), then explain how their move backfired."
+            "Lead with the missed idea, then how their move backfired."
         )
     elif classification["missed_opportunity"]:
         framing = (
-            "FRAMING: This is a MISS — the move itself wasn't terrible, but a much stronger "
-            "winning move was available. Focus the explanation on the missed opportunity, NOT on punishment."
+            "FRAMING: This is a MISS — a much stronger winning move was available. "
+            "Focus on the missed opportunity, NOT on punishment."
         )
     elif classification["created_problem"]:
         framing = (
-            f"FRAMING: This move is a {classification['severity']}. Explain WHY it's bad: "
-            "what did the opponent's best reply exploit, and what should the player have "
-            "played instead. Do NOT call this a good move and do NOT deflect the lesson to "
-            "an earlier move — the user clicked this move specifically and expects a concrete "
-            "explanation of what went wrong here."
+            f"FRAMING: This move is a {classification['severity']}. Explain WHY it's bad — "
+            "what did the opponent's reply exploit, what should the player have played instead."
         )
     else:
-        framing = (
-            "FRAMING: This move barely changed the position. Don't overstate — if anything, "
-            "the lesson is from an earlier move, not this one."
-        )
+        framing = "FRAMING: This move barely changed the position. Don't overstate."
 
-    relevant_principles = principles_for_move(data)
-
-    # Pre-compute all chess facts with python-chess — Gemini gets verified statements only
     try:
         facts = _compute_chess_facts(
             fen_before    = data.get('fen', ''),
@@ -433,87 +706,227 @@ def summarize_move(data: Dict[str, Any], model: Optional[str] = None, temperatur
     except Exception as e:
         raise RuntimeError(f"Chess analysis error: {e}")
 
-    player_color   = facts["player_color"]
-    opponent_color = facts["opponent_color"]
-    motif          = facts.get("motif")
-
-    # Look up the pre-written tactical pattern description
     from chess_principles import get_tactical_pattern
-    pattern = get_tactical_pattern(motif) if motif else None
+    pattern = get_tactical_pattern(facts.get("motif")) if facts.get("motif") else None
     pattern_block = (
-        f"TACTICAL PATTERN DETECTED: {pattern['name']}\n"
-        f"Definition: {pattern['description']}"
+        f"TACTICAL PATTERN: {pattern['name']} — {pattern['description']}"
         if pattern else ""
     )
 
-    # Phrased to make it clear these are pieces the MOVE created problems for,
-    # not pieces that were attacked the whole time. Empty list means the move
-    # itself didn't expose any of your pieces — don't say "X is under attack" if
-    # that attack predates this move.
+    # Relevant coaching principles, selected by tag from chess_principles. This
+    # was computed-but-discarded in the old single-call path (never interpolated
+    # into the prompt) — now wired into the shared block so both paths get it.
+    principles_block = principles_for_move(data)
+
+    # Rating-aware advice calibration: tells the LLM how deep to pitch the
+    # coaching (vocabulary, which concepts to use/avoid) for this player's level.
+    level_block = _level_guidance(data.get('rating'))
+
     hanging_line = (
-        "  Pieces this move left genuinely hanging (newly attacked AND under-defended): "
-        + ", ".join(facts["hanging_pieces"])
+        "Pieces newly hanging after the move: " + ", ".join(facts["hanging_pieces"])
         if facts["hanging_pieces"] else
-        "  This move did not leave any of the player's pieces newly hanging"
+        "This move did not leave any of the player's pieces newly hanging"
     )
     reply_line = (
-        f"  Opponent's best reply (verified): {facts['opponent_reply_desc']}"
+        f"Opponent's best reply (verified): {facts['opponent_reply_desc']}"
         if facts["opponent_reply_desc"] else ""
     )
-    best_line = f"  Best move (verified): {facts['best_move_desc']}"
+    best_line_str = f"Engine's best alternative (verified): {facts['best_move_desc']}"
 
-    prompt = """\
-You are an encouraging chess coach. All chess facts below were computed by a chess engine
-and python-chess — they are CORRECT. Do not recalculate or second-guess them.
+    fen_before = data.get('fen', '')
+    legal_before = ", ".join(_legal_sans(fen_before)) or "(none)"
+    attacks_list = _current_attacks(fen_before)
+    attacks_block = ("\n    " + "\n    ".join(attacks_list)) if attacks_list else " (no piece is currently attacked)"
 
-{framing}
+    section = (
+        f"  {framing}\n"
+        + (f"  {level_block}\n" if level_block else "")
+        + (f"  {pattern_block}\n" if pattern_block else "")
+        + (f"  {principles_block}\n" if principles_block else "")
+        + f"  Player: {facts['player_color']}\n"
+        + f"  Move played: {data.get('san','?')}  [{severity}]\n"
+        + f"  {hanging_line}\n"
+        + (f"  {reply_line}\n" if reply_line else "")
+        + f"  {best_line_str}\n"
+        + f"  Engine best: {data.get('best_san','?')}  (eval {data.get('best_eval_cp','?')} cp)\n"
+        + f"  PV after best: {data.get('pv_best_san','(none)')}\n"
+        + f"  All legal moves in this position: {legal_before}\n"
+        + f"  All existing attacks:{attacks_block}"
+    )
 
-{pattern_block}
+    fallback_summary = (
+        f"Engine best was {data.get('best_san','?')}: {facts.get('best_move_desc') or data.get('best_san','?')}. "
+        + (f"Opponent's punishment: {facts.get('opponent_reply_desc')}." if facts.get('opponent_reply_desc') else "")
+    ).strip()
 
-VERIFIED FACTS:
-  Player        : {player_color}
-  Move played   : {san}  [{severity}]
-{hanging_line}
-{reply_line}
-{best_line}
-  Engine best   : {best_san}  (eval {best_eval} cp)
-  PV after best : {pv_best}
+    fens = [fen_before]
+    try:
+        b = _chess.Board(fen_before)
+        b.push(b.parse_san(data.get('san', '')))
+        fens.append(b.fen())
+    except Exception:
+        pass
 
-YOUR TASK — write the coaching explanation that respects the FRAMING above:
-1. "summary": 1-2 sentences.
-   - If FRAMING says MISS: lead with "You had a chance to..." — name the missed idea.
-   - If FRAMING says created a problem: explain what the opponent's reply exploits.
-   - If FRAMING says both: lead with what they could have done, then how their move backfired.
-   - If FRAMING says barely changed: say so honestly — don't manufacture a lesson.
-   - Use ONLY squares, pieces, and moves from the VERIFIED FACTS. Do not invent any.
-2. "reasons": 1-2 bullets naming the chess principle violated (or missed opportunity).
-3. "what_next": 1-2 actionable tips the player should apply next time.
-4. "if_bad_fix": explain why {best_san} is better.
-   Set to null if the move barely changed winning chances.
+    return {
+        "section": section,
+        "fens": fens,
+        "facts": facts,
+        "best_san": data.get('best_san', '?'),
+        "fallback_summary": fallback_summary,
+        "classification": classification,
+    }
 
-Respond ONLY with JSON (no markdown fences):
-{{
-  "verdict": "good|ok|bad",
-  "summary": "...",
-  "reasons": ["...", "..."],
-  "what_next": ["...", "..."],
-  "if_bad_fix": {{
-     "missed_idea": "...",
-     "best_move": "{best_san}",
-     "why_best": "..."
-  }}
-}}""".format(
-        framing=framing,
-        pattern_block=pattern_block,
-        player_color=player_color,
-        san=data.get('san', '?'),
-        severity=severity,
-        hanging_line=hanging_line,
-        reply_line=reply_line,
-        best_line=best_line,
-        best_san=data.get('best_san', '?'),
-        best_eval=data.get('best_eval_cp', '?'),
-        pv_best=data.get('pv_best_san', '(none)'),
+
+def _validate_summarize_result(result: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """Post-hoc SAN validation on a summary result. Any text field citing
+    illegal SANs falls back to a mechanical sentence."""
+    fens = ctx["fens"]
+    facts = ctx["facts"]
+    best_san = ctx["best_san"]
+    fallback = ctx["fallback_summary"]
+
+    # A text field is rejected if ANY of:
+    #   (a) it cites a SAN that isn't legal in any provided FEN
+    #   (b) it uses a forbidden hand-wave phrase ("captures your bishop" with
+    #       no square, "fork on multiple pieces", etc.)
+    #   (c) for tactical fields (summary, missed_idea, why_best), it has no
+    #       concrete specifics at all — no squares, no SAN moves. Catches the
+    #       LLM dodging by going fully generic ("decisive advantage") instead.
+    def _ok_basic(s: str) -> bool:
+        return _validate_sans_legal(s, fens) and not _is_vague(s)
+    def _ok_concrete(s: str) -> bool:
+        return _ok_basic(s) and _has_specifics(s)
+
+    # Three cases for summary:
+    #   1. LLM returned a valid summary → keep it
+    #   2. LLM returned a summary that fails validation → replace with fallback
+    #   3. LLM dropped this item (empty {} padding from len-mismatch) → seed fallback
+    if not result.get('summary'):
+        result['summary'] = fallback
+    elif not _ok_concrete(result['summary']):
+        result['summary'] = fallback
+    fix = result.get('if_bad_fix')
+    if isinstance(fix, dict):
+        # Build a more useful missed_idea fallback than just "best_move_desc"
+        # (which is a one-liner like "Ng3"). Pair it with the engine's
+        # punishment so the user sees both the cost and the alternative.
+        mi_fallback = (
+            (f"{facts.get('best_move_desc') or best_san}. " if facts.get('best_move_desc') else "")
+            + (f"Punishment after your move: {facts.get('opponent_reply_desc')}." if facts.get('opponent_reply_desc') else "")
+        ).strip() or (facts.get('best_move_desc') or best_san)
+        for k, fb in (("missed_idea", mi_fallback), ("why_best", facts.get('best_move_desc') or best_san)):
+            if fix.get(k) and not _ok_concrete(fix[k]):
+                fix[k] = fb
+    if isinstance(result.get('what_next'), list):
+        result['what_next'] = [w for w in result['what_next'] if _ok_basic(w)]
+    return result
+
+
+def summarize_move_batch(items: list, model: Optional[str] = None, temperature: float = 0.15) -> list:
+    """Pack N flagged moves into ONE Gemini call. THE single explanation path.
+
+    summarize_move() is a thin wrapper that calls this with one item, so this
+    prompt/rule-set/schema/validator is the only one in the codebase — there is
+    no longer a second hand-synced copy to drift from.
+
+    Used by /summarize-batch — also saves free-tier quota dramatically when the
+    user clicks through several mistakes in the same game (N calls collapse to 1).
+
+    Temperature defaults LOW (0.15): this is a fact-grounded explanation task,
+    not creative writing. Higher temps made re-clicking the same move return
+    differently-worded explanations — the "feels inconsistent" symptom.
+
+    Input: list of data dicts (same shape as summarize_move expects).
+    Output: list of summary dicts (SAME LENGTH, SAME ORDER as input).
+    """
+    if not items:
+        return []
+    model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    item_blocks = []
+    sections = []
+    for i, data in enumerate(items, 1):
+        try:
+            ctx = _summarize_item_block(data)
+            item_blocks.append(ctx)
+            sections.append(f"#{i}:\n{ctx['section']}")
+        except Exception as e:
+            logger.warning("summarize_move_batch: item %d failed prep: %s", i, e)
+            item_blocks.append(None)
+            sections.append(f"#{i}:\n  (data unavailable — skip this item)")
+
+    # The strict rules below exist because earlier versions let vague tactical
+    # claims through ("a dangerous fork threatening two of your pawns" — which
+    # fork? which pawns?). This is now the ONLY explanation prompt in the
+    # codebase; summarize_move() routes through here with a single item.
+    prompt = (
+        "You are an encouraging chess coach. All chess facts below were computed "
+        "by a chess engine and python-chess — they are CORRECT. Do not "
+        "recalculate or second-guess them.\n\n"
+        "For EACH numbered position below, write a coaching explanation that "
+        "respects that position's FRAMING. Each position has its own verified "
+        "facts (move played, opponent reply, engine best move, hanging pieces, "
+        "legal moves, current attacks) — use only THOSE facts for THAT position.\n\n"
+        "When a position states a PLAYER LEVEL, pitch EVERY field (summary, "
+        "what_next, if_bad_fix) to that level — its vocabulary, which concepts to "
+        "use, and which to avoid. Advice above the player's level is a failure.\n\n"
+        "YOUR TASK — for each position, produce these fields:\n"
+        '1. "summary": 1-2 sentences explaining THIS move.\n'
+        "   - If FRAMING says MISS: explain the WINNING idea the player missed, "
+        "written as concrete chess (squares, pieces, threats), NOT generic "
+        "platitudes.\n"
+        "   - If FRAMING says the move is bad: explain what the opponent's reply "
+        "exploits.\n"
+        '2. "what_next": 1-2 actionable tips. May reference general principles.\n'
+        '3. "if_bad_fix": explain why the engine\'s best move is better.\n'
+        "   Set to null if the move barely changed winning chances.\n\n"
+        "STRICT RULES (violations make the answer wrong):\n"
+        "- Any chess move you cite by name (e.g. Nf3, Bxe7, Qd4+) MUST appear "
+        "in that position's 'All legal moves' list. If a move isn't on that "
+        "list, it does not exist and you cannot mention it.\n"
+        "- Any attack you cite MUST appear in that position's 'All existing "
+        "attacks' list, or be a direct consequence of the move played / engine "
+        "best move named in that position's facts.\n"
+        "- Never claim a piece attacks a piece of its OWN color (impossible).\n"
+        "- PRESERVE VERIFIED SPECIFICS. The 'Opponent's best reply' and 'Engine's "
+        "best alternative' lines already contain the exact squares and piece "
+        "names. Your explanation MUST repeat those specifics — never paraphrase "
+        "them into vague phrases. The verified fact is the FLOOR for detail, "
+        "not the ceiling.\n"
+        "- NAME EVERY PIECE AND SQUARE. When you mention a captured piece, an "
+        "attacked piece, or a fork target, you MUST include both the piece type "
+        "AND the square it sits on. 'captures your bishop' is FORBIDDEN — write "
+        "'captures your bishop on e5'. 'attacks your queen' is FORBIDDEN — write "
+        "'attacks your queen on d8'.\n"
+        "- NO HAND-WAVE QUANTIFIERS. Phrases like 'multiple pieces', 'several "
+        "pieces', 'your pieces', 'important pieces', 'key pieces', 'multiple "
+        "threats' are FORBIDDEN — name each piece with its square, or rewrite "
+        "to avoid the claim. 'Forks multiple pieces' must become 'forks your "
+        "queen on d7 and rook on a8'.\n"
+        "- NO VAGUE TACTICAL CLAIMS. If you say 'a fork', 'a pin', 'a double "
+        "attack', 'a threat', 'a discovered attack', or 'a skewer', you MUST "
+        "name the specific pieces and squares involved. 'A dangerous fork' "
+        "without naming the fork is forbidden.\n"
+        "- Don't dramatise. If the only thing happening is a 30-cp eval drop, "
+        "say so — don't invent tactics to explain it.\n\n"
+        "BAD vs GOOD examples (apply to every field):\n"
+        "  ✗ 'Your move Be5 allows White to capture your bishop and create a fork.'\n"
+        "  ✓ 'Your move Be5 lets White play Nxe5, capturing your bishop on e5 "
+        "and forking your queen on d8 and rook on a8.'\n"
+        "  ✗ 'Why Nf3 is better: it develops your knight and avoids tactics.'\n"
+        "  ✓ 'Why Nf3 is better: it develops your knight to f3, defends the "
+        "pawn on e5, and stops Black's queen from reaching h4.'\n\n"
+        "POSITIONS:\n"
+        + "\n\n".join(sections)
+        + "\n\nReturn analyses in the SAME ORDER as the numbered positions. "
+        "Respond with JSON ONLY (no markdown fences):\n"
+        "{\n"
+        '  "analyses": [\n'
+        '    {"summary": "...", "what_next": [...], '
+        '"if_bad_fix": {"missed_idea": "...", "best_move": "...", '
+        '"why_best": "..."} }\n'
+        "  ]\n"
+        "}"
     )
 
     try:
@@ -522,8 +935,21 @@ Respond ONLY with JSON (no markdown fences):
             contents=prompt,
             config={"temperature": float(temperature), "response_mime_type": "application/json"},
         ))
-        text = getattr(resp, "text", None) or getattr(resp, "candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text")
-        return json.loads(text or "{}")
+        text = getattr(resp, "text", None) or "{}"
+        result = json.loads(text)
+        analyses = result.get("analyses", [])
+        while len(analyses) < len(items):
+            analyses.append({})
+        analyses = analyses[:len(items)]
+        for i, analysis in enumerate(analyses):
+            ctx = item_blocks[i]
+            if ctx is None:
+                continue
+            try:
+                analyses[i] = _validate_summarize_result(analysis, ctx)
+            except Exception as e:
+                logger.warning("summarize_move_batch: item %d validation failed: %s", i, e)
+        return analyses
     except Exception as e:
         raise RuntimeError(f"Gemini error: {e}")
 
@@ -714,10 +1140,10 @@ def generate_player_summary(
     model: Optional[str] = None,
     temperature: float = 0.3,
 ) -> Dict[str, Any]:
-    """Generate a high-level player profile: top improvement lever + strengths vs peers.
+    """Generate a high-level player profile: top improvement lever + strengths + recommendations.
 
     Returns:
-      { improvement_lever, strengths, elo_context }
+      { improvement_lever, strengths, recommendations }
     """
     model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
@@ -745,16 +1171,66 @@ def generate_player_summary(
         for i, w in enumerate(sorted_weaknesses)
     ) or "  (none identified)"
 
+    # Offense vs defense distinction. This is the single most important signal
+    # for picking the right recommendations:
+    #   - active_blunders = moves where THIS PLAYER created problems (defensive failure
+    #     — they walked into a tactic, hung a piece, allowed a fork)
+    #   - miss_count       = moves where the PLAYER had a winning move and missed it
+    #     (offensive failure — they didn't find their own tactic)
+    # Puzzle-solving training (Lichess, etc.) primarily teaches OFFENSIVE pattern
+    # recognition: "you are the side delivering the fork — find the move." That helps
+    # when the player misses their own wins. It does NOT directly fix falling for
+    # opponent's tactics — that needs habit-building (calculate opponent's reply,
+    # CCT scan: Checks/Captures/Threats) and dedicated defensive puzzles.
+    if active_blunders > miss_count * 1.5:
+        primary_failure = "DEFENSIVE — the player keeps walking into opponent's tactics (forks, pins, hanging pieces). Recommendations must teach defensive habits (anticipating opponent's reply), not just tactical pattern recognition."
+    elif miss_count > active_blunders * 1.5:
+        primary_failure = "OFFENSIVE — the player misses their own winning tactics. Recommendations should target pattern recognition through tactical puzzles."
+    else:
+        primary_failure = "MIXED — both sides matter. Recommend a balance of defensive habit-building AND offensive puzzle training."
+
+    # Time-pressure vs recognition split of serious errors. This decides whether
+    # the right fix is "manage your clock / play slower" or "train recognition" —
+    # giving "do a safety check" to someone who blundered with 4 seconds left, or
+    # "play slower" to someone who blundered with 4 minutes left, is backwards.
+    # Only errors that carried clock data are counted (errors_clock_known).
+    err_tp    = stats.get("errors_time_pressure", 0)
+    err_wt    = stats.get("errors_with_time", 0)
+    err_known = stats.get("errors_clock_known", 0)
+    if err_known == 0:
+        time_profile = ("UNKNOWN — these games carried no clock data, so do NOT assume "
+                        "time pressure either way. Give the recognition/safety-check advice "
+                        "by default and don't mention time management unless asked.")
+    elif err_tp > err_wt * 1.5:
+        time_profile = (f"TIME-PRESSURE-DRIVEN — {err_tp} of {err_known} clocked serious errors "
+                        "happened in time pressure. The lever is TIME MANAGEMENT and slower time "
+                        "controls (Rapid 10-15+ min, not Blitz/Bullet), plus a FAST one-question "
+                        "safety check. Do NOT prescribe 'scan every check/capture/threat every "
+                        "move' — there is literally no time for it in their games.")
+    elif err_wt > err_tp * 1.5:
+        time_profile = (f"RECOGNITION-DRIVEN — {err_wt} of {err_known} clocked serious errors "
+                        "happened with time to spare. Time is NOT the problem; the player simply "
+                        "isn't checking. The lever is the one-question safety-check habit before "
+                        "committing a move, plus tactical puzzles so they spot threats faster.")
+    else:
+        time_profile = (f"MIXED time profile ({err_tp} in time pressure, {err_wt} with time, of "
+                        f"{err_known} clocked errors). Address both: a fast safety-check habit AND "
+                        "sensible time management / time-control choice.")
+
     prompt = """\
 You are an experienced chess coach writing a targeted improvement report for one specific player.
 
 PLAYER DATA (last {n} games, {time_class}, rating {rating}):
   Result         : {wins}W / {losses}L
   Accuracy       : {accuracy}% good moves
-  Active blunders: {active_blunders} (moves that made position worse)
-  Missed wins    : {miss_count} (had a winning move but didn't play it)
+  Active blunders: {active_blunders} (moves where the PLAYER created problems — defensive failure)
+  Missed wins    : {miss_count} (had a winning move but didn't play it — offensive failure)
   Blunders/game  : {blunders_per_game}
   Mistakes       : {mistakes}
+
+PRIMARY FAILURE MODE: {primary_failure}
+
+TIME PROFILE OF ERRORS: {time_profile}
 
 WHERE ERRORS OCCUR (by game phase):
 {phase_lines}
@@ -766,26 +1242,55 @@ TASK — respond with JSON only (no markdown fences):
 
 1. "improvement_lever": 2–3 sentences. The single most impactful thing to fix.
    RULES:
-   - Base it on the #1 weakness above and the phase where errors cluster most.
+   - Base it on the #1 weakness above, the phase where errors cluster most, AND the primary failure mode.
    - Be specific to THIS player's data — name the pattern, when it happens, and what to do instead.
-   - DO NOT write generic advice like "check for hanging pieces before every move" unless 'hanging pieces'
-     is genuinely the #1 weakness AND the phase data supports it. If the #1 weakness is positional drift,
-     missed tactics in the middlegame, or opening mistakes — say THAT specifically.
-   - A 500-rated player and a 800-rated player will have different root causes even if both blunder.
-     At 800, the issue is often calculation depth and missing 2-move combinations, not just one-move blunders.
+   - If the primary failure mode is DEFENSIVE: the lever must be a defensive habit
+     (e.g. "before every move, scan opponent's checks/captures/threats"), NOT
+     "find more tactics." A player who keeps getting forked doesn't need to find
+     more forks — they need to spot when one is about to land on them.
+   - At 500–800: the issue is usually one-move oversights and missing opponent's
+     immediate threats. At 800–1200: missing 2-move combinations and calculation depth.
    - Write as: "In your games, [specific recurring situation]. When this happens, [what goes wrong].
      Next time, [specific habit to build]."
 
 2. "strengths": list of 2–3 short strings (≤ 12 words each).
    Compare to typical {rating}-rated {time_class} players. Base on actual data only.
 
-3. "elo_context": 1–2 sentences comparing this player's blunder rate and accuracy to a typical
-   {rating}-rated player. Be honest and calibrated.
+3. "recommendations": list of 2–3 concrete next actions tied to THIS player's specific
+   weaknesses, phase data, AND primary failure mode. Each recommendation:
+   - Names a habit, study target, or drill — not a vague platitude
+   - Matches the failure mode:
+     * DEFENSIVE failure → habit drills, NOT offensive puzzles. Lichess does NOT have
+       "defend against forks" puzzles — that theme does not exist. Do not invent
+       puzzle themes. The ONLY genuinely defensive Lichess theme is "defensiveMove"
+       (find the only saving move when already under threat). For DEFENSIVE failure,
+       MUST include the safety-check habit (verbatim or close paraphrase):
+         "Before you commit a move, ask one question: 'Is it safe?' — after this move,
+          can my opponent take something of mine for free, or hit me with a check or
+          threat I can't meet? Check the move you're about to play, every time."
+       This is a FAST check on the move you've chosen, NOT a slow scan of every
+       check/capture/threat on the board — that's too slow for a real game.
+       Then let the TIME PROFILE decide the second habit:
+         - TIME-PRESSURE-DRIVEN → recommend playing slower time controls (Rapid 10-15+
+           min, not Blitz/Bullet) and basic time management (spend time on forcing/
+           sharp moves, play obvious moves quickly) so there's time for the safety check.
+         - RECOGNITION-DRIVEN or UNKNOWN → recommend "sit on your hands" (when you see a
+           move you like, pause and check the opponent's reply first) PLUS tactical
+           puzzles so threat-spotting becomes fast and automatic.
+       You MAY also recommend "defensiveMove" puzzles on Lichess, but NEVER
+       fork/pin/discovered-attack puzzles for a defensive-failure player.
+     * OFFENSIVE failure → tactical puzzle training on the missed patterns
+       ("Solve 10 fork puzzles daily on Lichess" is fine here — these themes exist).
+     * MIXED → include the safety-check habit AND one offensive puzzle drill, and add
+       time-management advice if the TIME PROFILE says time pressure is involved.
+   - References the actual weakness pattern from this player's data
+   - Is something the player can do THIS WEEK
+   - ≤ 35 words each (CCT and sit-on-hands recommendations may be longer to keep the wording intact)
 
 {{
   "improvement_lever": "...",
   "strengths": ["...", "...", "..."],
-  "elo_context": "..."
+  "recommendations": ["...", "...", "..."]
 }}""".format(
         n=len(games),
         time_class=time_class or "unknown time control",
@@ -799,6 +1304,8 @@ TASK — respond with JSON only (no markdown fences):
         mistakes=stats.get("mistakes", 0),
         phase_lines=phase_lines,
         weaknesses=weakness_lines,
+        primary_failure=primary_failure,
+        time_profile=time_profile,
     )
 
     try:
@@ -809,6 +1316,223 @@ TASK — respond with JSON only (no markdown fences):
         ))
         text = getattr(resp, "text", None) or "{}"
         return json.loads(text)
+    except Exception as e:
+        raise RuntimeError(f"Gemini error: {e}")
+
+
+def _describe_move(fen: str, san: str) -> dict:
+    """Pre-compute verified facts about ONE move in a position. Feeds the LLM
+    grounded ground-truth so it doesn't hallucinate colors, captures, or attack
+    squares. Same idea as _compute_chess_facts but scoped to a single move.
+
+    Returns a dict with `summary` (one-line human-readable description) plus
+    raw fields. `summary` is what we put into the prompt as a verified fact.
+    """
+    import chess as _chess
+    NAMES = {
+        _chess.PAWN: "pawn", _chess.KNIGHT: "knight", _chess.BISHOP: "bishop",
+        _chess.ROOK: "rook", _chess.QUEEN: "queen", _chess.KING: "king",
+    }
+    try:
+        board = _chess.Board(fen)
+        mover_color = "White" if board.turn == _chess.WHITE else "Black"
+        opp_color   = "Black" if board.turn == _chess.WHITE else "White"
+        move = board.parse_san(san)
+        from_sq = _chess.square_name(move.from_square)
+        to_sq   = _chess.square_name(move.to_square)
+        piece = board.piece_at(move.from_square)
+        piece_name = NAMES.get(piece.piece_type, "?") if piece else "?"
+
+        captured_desc = None
+        if board.is_capture(move):
+            # Handle en-passant separately — square is empty pre-push.
+            if board.is_en_passant(move):
+                captured_desc = f"{opp_color}'s pawn (en passant)"
+            else:
+                cap = board.piece_at(move.to_square)
+                if cap:
+                    captured_desc = f"{opp_color}'s {NAMES[cap.piece_type]} on {to_sq}"
+
+        after = board.copy(); after.push(move)
+        gives_check = after.is_check()
+        is_mate     = after.is_checkmate()
+
+        # Squares the moved piece now attacks, with the piece sitting on each.
+        # This is what enables (and constrains) any "fork" claim.
+        attacks_now = []
+        for sq in after.attacks(move.to_square):
+            tgt = after.piece_at(sq)
+            if tgt and tgt.color != board.turn:
+                # board.turn is still the mover here because we haven't called push on `board`
+                # (we pushed on `after`). The mover is `mover_color`; targets are opp_color.
+                attacks_now.append(f"{opp_color}'s {NAMES[tgt.piece_type]} on {_chess.square_name(sq)}")
+
+        # Build the human summary in a single deterministic sentence.
+        parts = [f"{san} = {mover_color} {piece_name} {from_sq}→{to_sq}"]
+        if captured_desc:
+            parts.append(f"captures {captured_desc}")
+        if is_mate:
+            parts.append("delivering checkmate")
+        elif gives_check:
+            parts.append("with check")
+        # Non-king targets after the move — what the piece now threatens.
+        non_king_attacks = [a for a in attacks_now if " king " not in (" " + a + " ").lower()]
+        if non_king_attacks:
+            parts.append(f"and now attacks {', '.join(non_king_attacks)}")
+        summary = "; ".join(parts)
+
+        return {
+            "summary": summary,
+            "mover_color": mover_color,
+            "piece": piece_name,
+            "from": from_sq,
+            "to": to_sq,
+            "captures": captured_desc,
+            "gives_check": gives_check,
+            "is_mate": is_mate,
+            "attacks_now": attacks_now,
+        }
+    except Exception as e:
+        # If parsing fails for any reason, return the SAN as-is so the LLM at
+        # least sees something — but log so we can diagnose.
+        logger.warning("describe_move failed for %s in %s: %s", san, fen, e)
+        return {"summary": f"{san} (could not parse)", "error": str(e)}
+
+
+def explain_drill_batch(items: list, model: Optional[str] = None, temperature: float = 0.4) -> list:
+    """Generate threat + correction explanations for a batch of drill questions in ONE call.
+
+    Designed to keep Gemini quota usage minimal — instead of N calls for N questions,
+    pack them all into a single prompt asking for N JSON outputs in order.
+
+    Input: list of dicts, each:
+      { fen_after, played_san, opponent_best_san, correction_fen, correction_best_san, motif }
+
+    Output: list of dicts (SAME LENGTH, SAME ORDER as input), each:
+      { threat_explanation: str, correction_explanation: str }
+    """
+    if not items:
+        return []
+    # Drill batch defaults to Pro 3.1 — it's the most faithful at "use ONLY the
+    # verified facts" instruction-following. Pro's lower daily quota is OK here
+    # because explain_drill_batch runs once per Drill session and results cache
+    # forever in localStorage. Override with GEMINI_MODEL_DRILL to test others.
+    model = model or os.getenv("GEMINI_MODEL_DRILL", "gemini-3.1-pro-preview")
+
+    # Pre-compute python-chess-verified facts for each item so the LLM never has
+    # to derive piece colors, capture targets, or attack squares from the FEN.
+    # In addition to the single-move facts we already had, also feed:
+    #   - the FULL list of legal moves in each relevant position (move universe bound)
+    #   - every CURRENT attack relationship (so the LLM doesn't invent forks/pins)
+    sections = []
+    for i, it in enumerate(items, 1):
+        fen_after = it.get('fen_after', '')
+        correction_fen = it.get('correction_fen', '')
+        threat_facts = _describe_move(fen_after, it.get('opponent_best_san', ''))
+        correction_facts = None
+        if correction_fen and it.get('correction_best_san'):
+            correction_facts = _describe_move(correction_fen, it['correction_best_san'])
+
+        # Also describe what the PLAYER just played — context for understanding
+        # what threat the correction is trying to neutralize.
+        played_facts = None
+        if correction_fen and it.get('played_san'):
+            played_facts = _describe_move(correction_fen, it['played_san'])
+
+        legal_after = ", ".join(_legal_sans(fen_after)) or "(none)"
+        legal_correction = ", ".join(_legal_sans(correction_fen)) if correction_fen else ""
+        attacks_after = _current_attacks(fen_after)
+        attacks_correction = _current_attacks(correction_fen) if correction_fen else []
+
+        section = (
+            f"#{i}:\n"
+            f"  Player previously played: {played_facts['summary'] if played_facts else it.get('played_san','?')}\n"
+            f"  THREAT — Opponent's best reply (verified): {threat_facts['summary']}\n"
+            f"  CORRECTION — Player's best alternative (verified): "
+            f"{correction_facts['summary'] if correction_facts else '(none)'}\n"
+            f"  Tactical motif (engine-detected): {it.get('motif') or 'none'}\n"
+            f"  All legal moves in the THREAT position (opponent to move): {legal_after}\n"
+            f"  All existing attacks in the THREAT position:\n    "
+            + ("\n    ".join(attacks_after) if attacks_after else "(no piece is currently attacked)")
+        )
+        if correction_fen:
+            section += (
+                f"\n  All legal moves in the CORRECTION position (player to move): {legal_correction}\n"
+                f"  All existing attacks in the CORRECTION position:\n    "
+                + ("\n    ".join(attacks_correction) if attacks_correction else "(no piece is currently attacked)")
+            )
+        sections.append(section)
+
+    prompt = (
+        "You are a chess coach explaining drill positions. Every fact below was "
+        "computed by python-chess from the actual board state and is CORRECT. "
+        "Your job is to write engaging coaching prose grounded in those facts.\n\n"
+        "STRICT RULES — violations make the explanation wrong:\n"
+        "- Use ONLY the pieces, squares, captures, and attacks listed in the "
+        "verified facts. The color of each piece is stated explicitly — never "
+        "claim a piece attacks another piece of its OWN color (that's impossible).\n"
+        "- Any chess move you reference by name (e.g. Nf3, Bxe7, Qd4+) MUST appear "
+        "in the 'All legal moves' list for the relevant position. If a move "
+        "isn't on that list, the move does not exist and you cannot mention it.\n"
+        "- Any attack you reference MUST appear in the 'All existing attacks' "
+        "list. Do not invent attack relationships between pieces.\n"
+        "- If the verified facts don't mention a fork, double attack, pin, or "
+        "particular target piece — don't invent one. A knight on d6 only reaches "
+        "the 8 squares the verified facts say it attacks; don't claim it forks "
+        "anything else.\n"
+        "- Stick to what the verified facts state. If they say the knight "
+        "captures a pawn on d6, don't promote that to 'captures the bishop' "
+        "or 'forks the queen.'\n\n"
+        "For each numbered position write TWO short explanations:\n\n"
+        "1. threat_explanation (1-2 sentences): WHY the opponent's best reply "
+        "works — what it captures, what it threatens next. Stay grounded in the "
+        "THREAT verified fact.\n\n"
+        "2. correction_explanation (1-2 sentences): WHY the player's best "
+        "alternative move is better than what they played — what it captures, "
+        "defends, or neutralizes about the threat. Stay grounded in the "
+        "CORRECTION verified fact.\n\n"
+        "POSITIONS:\n"
+        + "\n\n".join(sections)
+        + "\n\nReturn the explanations in the SAME ORDER as the numbered positions above. "
+        "Respond with JSON ONLY (no markdown fences):\n"
+        "{\n"
+        '  "explanations": [\n'
+        '    {"threat_explanation": "...", "correction_explanation": "..."},\n'
+        "    ...\n"
+        "  ]\n"
+        "}"
+    )
+
+    try:
+        resp = _with_retry(lambda c: c.models.generate_content(
+            model=model,
+            contents=prompt,
+            config={"temperature": float(temperature), "response_mime_type": "application/json"},
+        ))
+        text = getattr(resp, "text", None) or "{}"
+        result = json.loads(text)
+        explanations = result.get("explanations", [])
+        # Pad/truncate to match input length — defensive in case Gemini returns wrong count.
+        while len(explanations) < len(items):
+            explanations.append({"threat_explanation": "", "correction_explanation": ""})
+        explanations = explanations[:len(items)]
+
+        # Post-hoc fact-check: scan each explanation for chess-move-shaped tokens
+        # and verify every move is actually legal in one of the relevant positions.
+        # If any cited move is illegal/impossible, fall back to the mechanical
+        # description for that field. We never reject silently — the user just
+        # sees the verified description instead of LLM polish.
+        for i, expl in enumerate(explanations):
+            it = items[i]
+            fen_after = it.get('fen_after')
+            correction_fen = it.get('correction_fen')
+            fens = [fen_after, correction_fen]
+            if expl.get('threat_explanation') and not _validate_sans_legal(expl['threat_explanation'], fens):
+                expl['threat_explanation'] = _describe_move(fen_after, it.get('opponent_best_san', ''))['summary']
+            if expl.get('correction_explanation') and correction_fen and not _validate_sans_legal(expl['correction_explanation'], fens):
+                expl['correction_explanation'] = _describe_move(correction_fen, it.get('correction_best_san', ''))['summary']
+
+        return explanations
     except Exception as e:
         raise RuntimeError(f"Gemini error: {e}")
 
