@@ -243,19 +243,37 @@ def _compute_chess_facts(fen_before: str, player_san: str, pv_played_san: str, b
                         if board_copy.is_pinned(player_color, sq):
                             pinned_pieces.append(f"{NAMES[piece.piece_type]} on {_chess.square_name(sq)}")
 
-                # Discovered attack: a piece OTHER than the mover now attacks a player piece
+                # Discovered attack: the opponent's move VACATED a square, opening a
+                # sliding piece's line onto one of the player's pieces. Two checks,
+                # both required — without them any piece that merely happened to be
+                # attacked by a static enemy piece got mislabelled (the Bg2 false
+                # positive: g4 already hit f5 and Ne5 already hit f7 before Bg2):
+                #   1. NEW — the attacker did not already hit the target before the move.
+                #   2. GENUINELY DISCOVERED — the attacker is a slider (rook/bishop/
+                #      queen) whose ray to the target runs through the square the mover
+                #      just left (knights/pawns/kings can't be "unblocked").
+                # Mirrors the before/after diff the hanging-piece detector uses above.
+                SLIDERS = (_chess.BISHOP, _chess.ROOK, _chess.QUEEN)
                 discovered_targets = []
                 for sq in _chess.SQUARES:
                     piece = board_copy.piece_at(sq)
-                    if piece and piece.color == player_color:
-                        if board_copy.is_attacked_by(not player_color, sq):
-                            # Check if the attacker is NOT the piece that just moved
-                            attackers = board_copy.attackers(not player_color, sq)
-                            non_mover_attackers = [a for a in attackers if a != opp_move.to_square]
-                            if non_mover_attackers:
-                                discovered_targets.append(
-                                    f"{NAMES[piece.piece_type]} on {_chess.square_name(sq)}"
-                                )
+                    if not (piece and piece.color == player_color):
+                        continue
+                    attackers_after = board_copy.attackers(not player_color, sq)
+                    attackers_before = board.attackers(not player_color, sq)
+                    for a in attackers_after:
+                        if a == opp_move.to_square:
+                            continue  # the mover itself — a direct attack, not discovered
+                        if a in attackers_before:
+                            continue  # attack already existed — not newly revealed
+                        atk_piece = board_copy.piece_at(a)
+                        if not atk_piece or atk_piece.piece_type not in SLIDERS:
+                            continue
+                        if opp_move.from_square in _chess.SquareSet(_chess.between(a, sq)):
+                            discovered_targets.append(
+                                f"{NAMES[piece.piece_type]} on {_chess.square_name(sq)}"
+                            )
+                            break
 
                 # --- Assign primary motif (priority order) ---
                 is_checkmate = board_copy.is_checkmate()
