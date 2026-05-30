@@ -321,7 +321,7 @@ function PlayerSummary({ username, data }) {
 
       {expanded && (
         <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 10 }}>
-          {summary.strengths?.length > 0 && (
+          {Array.isArray(summary.strengths) && summary.strengths.length > 0 && (
             <div className="explain-better">
               <div className="explain-label" style={{ color: "var(--green)" }}>What you do well</div>
               <ul style={{ margin: "4px 0 0", paddingLeft: 16 }}>
@@ -329,7 +329,7 @@ function PlayerSummary({ username, data }) {
               </ul>
             </div>
           )}
-          {summary.recommendations?.length > 0 && (
+          {Array.isArray(summary.recommendations) && summary.recommendations.length > 0 && (
             <div className="explain-tip">
               <div className="explain-label" style={{ color: "var(--blue)" }}>Recommendations</div>
               <ul style={{ margin: "4px 0 0", paddingLeft: 16 }}>
