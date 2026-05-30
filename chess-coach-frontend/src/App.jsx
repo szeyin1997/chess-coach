@@ -169,7 +169,7 @@ function TryModePanel({ result, explaining, explanation, onAnalyze, onNext, onUn
           {explanation.if_bad_fix.why_best}
         </div>
       )}
-      {explanation?.what_next?.length > 0 && !explaining && (
+      {Array.isArray(explanation?.what_next) && explanation.what_next.length > 0 && !explaining && (
         <div className="explain-tip">
           <div className="explain-label" style={{ color: "var(--blue)" }}>Next time</div>
           <ul style={{ margin: "4px 0 0", paddingLeft: 16 }}>
@@ -253,7 +253,7 @@ function ExplainPanel({ explanation, bestMove, explaining, posIndex, onAnalyze, 
           )}
         </div>
       )}
-      {explanation?.what_next?.length > 0 && (
+      {Array.isArray(explanation?.what_next) && explanation.what_next.length > 0 && (
         <div className="explain-tip">
           <div className="explain-label" style={{ color: "var(--blue)" }}>Next time</div>
           <ul style={{ margin: "4px 0 0", paddingLeft: 16 }}>
@@ -444,7 +444,7 @@ export default function App() {
   // explanations for EVERY flagged move in that game so subsequent clicks are
   // instant cache hits. Persists to localStorage across sessions.
   const [summaryCache, setSummaryCache] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("chess_coach_summaries_v5") || "{}"); }
+    try { return JSON.parse(localStorage.getItem("chess_coach_summaries_v6") || "{}"); }
     catch { return {}; }
   });
   // Track which game's batch is currently in flight (one at a time is fine —
@@ -855,7 +855,7 @@ export default function App() {
               }
             });
             setSummaryCache(next);
-            try { localStorage.setItem("chess_coach_summaries_v5", JSON.stringify(next)); } catch {}
+            try { localStorage.setItem("chess_coach_summaries_v6", JSON.stringify(next)); } catch {}
             const mine = next[cacheKey];
             if (mine) {
               safeSetExplanation(mine);
@@ -894,7 +894,7 @@ export default function App() {
           // Cache successful single calls too
           const next = { ...summaryCache, [cacheKey]: ai };
           setSummaryCache(next);
-          try { localStorage.setItem("chess_coach_summaries_v5", JSON.stringify(next)); } catch {}
+          try { localStorage.setItem("chess_coach_summaries_v6", JSON.stringify(next)); } catch {}
           if (reviewSelectedMoveRef.current === move) {
             const derived = bestMoveFromExplanation(ai, move.fen_before);
             if (derived) setReviewBestMove(derived);
