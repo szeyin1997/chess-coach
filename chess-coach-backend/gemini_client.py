@@ -7,8 +7,35 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 _RATE_LIMIT_KEYWORDS = ("429", "rate limit", "quota", "resource exhausted", "resourceexhausted", "too many requests")
-_DAILY_QUOTA_KEYWORDS = ("per_day", "perday", "daily", "free_tier_requests", "requests_per_day")
+# True DAILY-dimension markers only. NOTE: do NOT include the quota METRIC string
+# 'free_tier_requests' here — it appears in EVERY free-tier 429 (per-minute AND
+# per-day), so matching on it misread a transient per-minute rate limit as daily
+# exhaustion and permanently disabled the key for the process. The dimension is in
+# the quotaId (...PerDayPerProject... vs ...PerMinutePerProject...).
+_DAILY_QUOTA_KEYWORDS  = ("per_day", "perday", "requests_per_day", "requestsperday", "perdayperproject")
+_PER_MINUTE_KEYWORDS   = ("per_minute", "perminute", "requests_per_minute", "perminuteperproject")
 _TRANSIENT_KEYWORDS  = ("503", "unavailable", "overloaded", "internal error", "500", "deadline", "timeout")
+
+
+def _classify_gemini_error(err_text: str) -> str:
+    """Classify a Gemini exception string into one of:
+      - "transient"  : 503/overload/timeout — retry the SAME key, clears fast.
+      - "daily"      : per-DAY quota exhausted — mark key exhausted, fail over.
+      - "rate_limit" : 429 that is NOT explicitly per-day (per-minute or an
+                       ambiguous 429) — retry the same key with backoff. A
+                       per-minute limit must NEVER exhaust the key.
+      - "other"      : anything else — surface to the caller.
+    """
+    e = (err_text or "").lower()
+    if any(k in e for k in _TRANSIENT_KEYWORDS):
+        return "transient"
+    is_per_minute = any(k in e for k in _PER_MINUTE_KEYWORDS)
+    is_per_day    = any(k in e for k in _DAILY_QUOTA_KEYWORDS)
+    if is_per_day and not is_per_minute:
+        return "daily"
+    if any(k in e for k in _RATE_LIMIT_KEYWORDS):
+        return "rate_limit"
+    return "other"
 
 _DAILY_QUOTA_MSG = (
     "Daily Gemini quota reached on all configured API keys. "
@@ -97,12 +124,9 @@ def _with_retry(fn, retries: int = 4, base_delay: float = 2.0):
                 return fn(entry["client"])
             except Exception as e:
                 last_exc = e
-                err = str(e).lower()
-                is_rate_limit  = any(kw in err for kw in _RATE_LIMIT_KEYWORDS)
-                is_daily_quota = any(kw in err for kw in _DAILY_QUOTA_KEYWORDS)
-                is_transient   = any(kw in err for kw in _TRANSIENT_KEYWORDS)
+                kind = _classify_gemini_error(str(e))
 
-                if is_daily_quota:
+                if kind == "daily":
                     logger.warning("Daily quota reached on %s key — marking exhausted, "
                                    "%s", entry["label"],
                                    "failing over to next key" if not is_last_key else "no more keys to try")
@@ -111,14 +135,14 @@ def _with_retry(fn, retries: int = 4, base_delay: float = 2.0):
                         raise RuntimeError(_DAILY_QUOTA_MSG)
                     break  # try the next key
 
-                if (is_rate_limit or is_transient) and attempt < retries - 1:
-                    # Rate limits need longer waits; transient errors clear faster.
-                    wait = (base_delay * (2 ** attempt)) * (2.5 if is_rate_limit else 1.0)
-                    kind = "rate limit" if is_rate_limit else "transient (503/overloaded)"
+                if kind in ("rate_limit", "transient") and attempt < retries - 1:
+                    # Rate limits (per-minute) need longer waits; transient 503s clear faster.
+                    # Neither exhausts the key — the limit/outage is temporary.
+                    wait = (base_delay * (2 ** attempt)) * (2.5 if kind == "rate_limit" else 1.0)
                     logger.warning("Gemini %s on %s, retrying in %.1fs (attempt %d/%d)",
                                    kind, entry["label"], wait, attempt + 1, retries)
                     time.sleep(wait)
-                elif is_transient:
+                elif kind == "transient":
                     raise RuntimeError(_TRANSIENT_MSG)
                 else:
                     raise
