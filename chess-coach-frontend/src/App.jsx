@@ -631,6 +631,11 @@ export default function App() {
       const data = {
         games: res.data.games || [],
         common_weaknesses: res.data.common_weaknesses || [],
+        // The endpoint returns ok:true even when the cross-game weakness LLM call
+        // failed (e.g. Gemini daily quota) — the failure is reported in `error`
+        // alongside an empty common_weaknesses. Capture it so the empty-state can
+        // tell the truth instead of rendering "you're playing well!" over a failure.
+        weaknesses_error: res.data.error || null,
         player_stats: res.data.player_stats || null,
         player_summary: res.data.player_summary || null,
         player_rating: res.data.player_rating || null,
@@ -1906,7 +1911,9 @@ export default function App() {
                   })}
                   {multiGameData.common_weaknesses.length === 0 && (
                     <div className="card" style={{ textAlign:"center", padding:"32px", color:"var(--text-secondary)" }}>
-                      No significant recurring weaknesses found. You're playing well!
+                      {multiGameData.weaknesses_error
+                        ? "Weakness analysis couldn't run — the AI assistant hit its daily request limit. The games and stats above are still accurate; try the weakness analysis again after the limit resets (usually within a day)."
+                        : "No significant recurring weaknesses found. You're playing well!"}
                     </div>
                   )}
                 </div>
