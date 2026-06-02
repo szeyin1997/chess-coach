@@ -30,6 +30,21 @@ def test_quiet_move_is_not_a_discovered_attack():
     assert facts["motif"] != "discovered_attack"
 
 
+def test_best_move_desc_grounds_real_consequences_only():
+    """A quiet best move's verified description must state only TRUE consequences,
+    so the LLM can't invent (e.g. 'Qc5 attacks the queen on g3' — it doesn't).
+    Qc5 here genuinely defends the c4 knight; it does not reach g3."""
+    facts = _compute_chess_facts(
+        fen_before="r3k2r/pp3p1p/2pqp1p1/5b2/2n5/P1P2PQ1/7P/R1B1KB1R b KQkq - 0 19",
+        player_san="e5",
+        pv_played_san="e5 Bxc4",
+        best_san="Qc5",
+    )
+    desc = facts["best_move_desc"]
+    assert "c4" in desc and "defends" in desc, desc
+    assert "g3" not in desc, desc
+
+
 def test_real_discovered_attack_is_still_detected():
     """Genuine discovery must still fire. Black knight on e5 screens the black
     rook on e8 from the white queen on e1. After White's waiting move (Kh1),

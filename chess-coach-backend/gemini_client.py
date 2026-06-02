@@ -322,6 +322,101 @@ def _validate_sans_legal(text: str, fens: list) -> bool:
     return True
 
 
+# A bare square (e4) is ambiguous in prose: "play e4" (a move) vs "the pawn on
+# e4" (a reference). We only treat it as a MOVE claim when it follows a
+# suggestion verb — then it must be a legal pawn destination. References are left
+# alone so we don't over-reject and degrade quality.
+_SUGGEST_SQUARE_RE = _re.compile(
+    r"\b(?:play|played|playing|plays|push|pushing|move|moving|try|consider|"
+    r"instead of|rather than|better (?:is|was|would be|to play)|"
+    r"should(?:'ve| have)? played|could(?:'ve| have)? played|go for|opt for)\s+"
+    r"(?:the move\s+|with\s+|playing\s+)?([a-h][1-8])\b",
+    _re.IGNORECASE,
+)
+
+
+def _relevant_fens(fen_before: str, played_san: str, best_san: str, *pv_lines: str) -> list:
+    """Every position a move citation could legitimately refer to: before the
+    move, after the played move, after the engine's best move, and along EACH
+    supplied principal variation (best line, played/punishment line, …). A move
+    is 'real' for this analysis iff it is legal in at least one of these
+    positions, so legality checks use the union — never just the starting
+    position (which over-rejected opponent replies and deep follow-up lines)."""
+    import chess as _chess
+    out: list = []
+    seen = set()
+
+    def add(b: "_chess.Board"):
+        f = b.fen()
+        if f not in seen:
+            seen.add(f)
+            out.append(f)
+
+    try:
+        base = _chess.Board(fen_before)
+    except Exception:
+        return [fen_before] if fen_before else []
+    add(base)
+    for san in (played_san, best_san):
+        if san:
+            try:
+                b = base.copy(); b.push_san(san); add(b)
+            except Exception:
+                pass
+    for pv in pv_lines:
+        if not pv:
+            continue
+        b = base.copy()
+        for tok in pv.split():
+            tok = _re.sub(r"^\d+\.+", "", tok).strip()  # strip "20." move-number prefixes
+            if not tok or tok in ("1-0", "0-1", "1/2-1/2", "*", "..."):
+                continue
+            try:
+                b.push_san(tok); add(b)
+            except Exception:
+                break  # this PV desynced — stop walking it; key positions already added
+    return out
+
+
+def _first_illegal_move(text: str, fens: list):
+    """Return the first move token in `text` that is illegal in EVERY position in
+    `fens`, else None. Catches piece/capture/castle/promotion SANs always, and
+    bare pawn-destination squares only when phrased as a suggestion (so 'the pawn
+    on e4' is not flagged). This is the enforcement primitive behind the
+    'no illegal move ever reaches the user' guarantee."""
+    import chess as _chess
+    if not text:
+        return None
+    boards = []
+    for f in fens:
+        if not f:
+            continue
+        try:
+            boards.append(_chess.Board(f))
+        except Exception:
+            pass
+    if not boards:
+        return None
+
+    def legal_anywhere(tok: str) -> bool:
+        for b in boards:
+            try:
+                b.parse_san(tok)
+                return True
+            except Exception:
+                continue
+        return False
+
+    for tok in _SAN_RE.findall(text):
+        if not legal_anywhere(tok):
+            return tok
+    for m in _SUGGEST_SQUARE_RE.finditer(text):
+        sq = m.group(1)
+        if not legal_anywhere(sq):  # parse_san("e4") tests the pawn push to e4
+            return sq
+    return None
+
+
 def _compute_chess_facts(fen_before: str, player_san: str, pv_played_san: str, best_san: str) -> dict:
     """Use python-chess to derive verified facts about a move. No LLM involved."""
     import chess as _chess
@@ -534,7 +629,8 @@ def _compute_chess_facts(fen_before: str, player_san: str, pv_played_san: str, b
     if motif is None and hanging:
         motif = "hanging_piece"
 
-    # --- What does the best move defend/create? ---
+    # --- What does the best move defend/create? (verified, so the LLM doesn't
+    # invent consequences for quiet moves — e.g. "Qc5 attacks g3" when it can't).
     best_move_desc = None
     board_best = _chess.Board(fen_before)
     try:
@@ -547,6 +643,22 @@ def _compute_chess_facts(fen_before: str, player_san: str, pv_played_san: str, b
         board_best.push(bm)
         if board_best.is_check():
             parts.append("gives check")
+        # Real consequences of the moved piece, computed from the board: enemy
+        # pieces it now attacks, and own attacked pieces it now defends. Capped to
+        # keep the fact terse. Only TRUE relationships are emitted.
+        attacks_desc, defends_desc = [], []
+        for sq in board_best.attacks(bm.to_square):
+            p = board_best.piece_at(sq)
+            if not p:
+                continue
+            if p.color != player_color and p.piece_type != _chess.KING:
+                attacks_desc.append(f"the opponent's {NAMES[p.piece_type]} on {_chess.square_name(sq)}")
+            elif p.color == player_color and board_best.is_attacked_by(not player_color, sq):
+                defends_desc.append(f"your {NAMES[p.piece_type]} on {_chess.square_name(sq)}")
+        if defends_desc:
+            parts.append("defends " + " and ".join(defends_desc[:2]))
+        if attacks_desc:
+            parts.append("attacks " + " and ".join(attacks_desc[:2]))
         best_move_desc = (f"{best_san} " + " and ".join(parts)) if parts else best_san
     except Exception:
         best_move_desc = best_san
@@ -783,13 +895,17 @@ def _summarize_item_block(data: Dict[str, Any]) -> Dict[str, Any]:
         + (f"Opponent's punishment: {facts.get('opponent_reply_desc')}." if facts.get('opponent_reply_desc') else "")
     ).strip()
 
-    fens = [fen_before]
-    try:
-        b = _chess.Board(fen_before)
-        b.push(b.parse_san(data.get('san', '')))
-        fens.append(b.fen())
-    except Exception:
-        pass
+    # Legality universe for move-citation validation: before / after-played /
+    # after-best / along the best PV. Checking against the union (not just
+    # fen_before) lets legitimate opponent replies and follow-up moves through
+    # while still catching fabricated moves.
+    fens = _relevant_fens(
+        fen_before,
+        data.get('san', ''),
+        data.get('best_san', ''),
+        data.get('pv_best_san', ''),
+        data.get('pv_played_san', ''),
+    )
 
     return {
         "section": section,
@@ -817,7 +933,9 @@ def _validate_summarize_result(result: Dict[str, Any], ctx: Dict[str, Any]) -> D
     #       concrete specifics at all — no squares, no SAN moves. Catches the
     #       LLM dodging by going fully generic ("decisive advantage") instead.
     def _ok_basic(s: str) -> bool:
-        return _validate_sans_legal(s, fens) and not _is_vague(s)
+        # Reject if ANY cited move (piece or pawn-suggestion) is illegal in every
+        # relevant position, or if the phrasing is a forbidden hand-wave.
+        return _first_illegal_move(s, fens) is None and not _is_vague(s)
     def _ok_concrete(s: str) -> bool:
         return _ok_basic(s) and _has_specifics(s)
 
@@ -844,6 +962,13 @@ def _validate_summarize_result(result: Dict[str, Any], ctx: Dict[str, Any]) -> D
     if not isinstance(fix, dict):
         result.pop('if_bad_fix', None)
     else:
+        # The canonical suggested move is the ENGINE's best move — legal by
+        # construction and correct by definition. Never trust the LLM's free-text
+        # choice here (it drifted to wrong/illegal moves). This is the backbone of
+        # the "every suggested move is legal" guarantee; the prose around it is
+        # then validated against the relevant-position universe below.
+        if best_san:
+            fix['best_move'] = best_san
         # Drop any non-string field so the UI never renders an object as a child.
         for k in ('missed_idea', 'best_move', 'why_best'):
             if k in fix and not isinstance(fix[k], str):
@@ -938,6 +1063,12 @@ def summarize_move_batch(items: list, model: Optional[str] = None, temperature: 
         "- Any attack you cite MUST appear in that position's 'All existing "
         "attacks' list, or be a direct consequence of the move played / engine "
         "best move named in that position's facts.\n"
+        "- The ONLY attacks/defenses the engine's best move creates are the ones "
+        "written in the 'Engine's best alternative (verified)' line. Do NOT infer "
+        "any others. If that line says the move defends a piece, do not also claim "
+        "it attacks something unless that is stated too. Inventing a consequence "
+        "(e.g. 'Qc5 attacks the queen on g3' when the verified fact doesn't say so) "
+        "makes the answer wrong.\n"
         "- Never claim a piece attacks a piece of its OWN color (impossible).\n"
         "- PRESERVE VERIFIED SPECIFICS. The 'Opponent's best reply' and 'Engine's "
         "best alternative' lines already contain the exact squares and piece "
