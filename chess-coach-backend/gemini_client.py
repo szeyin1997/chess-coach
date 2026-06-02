@@ -286,7 +286,12 @@ def _has_specifics(text: str) -> bool:
 
 
 def _validate_sans_legal(text: str, fens: list) -> bool:
-    """Scan text for chess-move-shaped tokens; return False if any token is
+    """DEPRECATED — superseded by _first_illegal_move (which also catches pawn-move
+    suggestions and is used with the full _relevant_fens universe). Kept only so
+    older references don't break; do NOT use for new code — it misses pawn pushes
+    and would weaken the 'every suggested move is legal' guarantee.
+
+    Scan text for chess-move-shaped tokens; return False if any token is
     NOT legal in at least one of the supplied FENs. Used as a post-hoc filter
     to catch LLM hallucinations like 'White pawn captures Black bishop on e7'
     when no pawn move can reach e7 in the actual position.
@@ -1708,10 +1713,16 @@ def explain_drill_batch(items: list, model: Optional[str] = None, temperature: f
             it = items[i]
             fen_after = it.get('fen_after')
             correction_fen = it.get('correction_fen')
-            fens = [fen_after, correction_fen]
-            if expl.get('threat_explanation') and not _validate_sans_legal(expl['threat_explanation'], fens):
+            # Same legality universe + detection as the summarize path: union of
+            # the threat and correction positions and the moves involved, and
+            # _first_illegal_move (catches pawn-move suggestions, not just piece
+            # SANs). Any field citing an illegal move falls back to verified text.
+            fens = _relevant_fens(fen_after, it.get('opponent_best_san', ''), it.get('opponent_best_san', ''))
+            if correction_fen:
+                fens = fens + _relevant_fens(correction_fen, it.get('played_san', ''), it.get('correction_best_san', ''))
+            if expl.get('threat_explanation') and _first_illegal_move(expl['threat_explanation'], fens):
                 expl['threat_explanation'] = _describe_move(fen_after, it.get('opponent_best_san', ''))['summary']
-            if expl.get('correction_explanation') and correction_fen and not _validate_sans_legal(expl['correction_explanation'], fens):
+            if expl.get('correction_explanation') and correction_fen and _first_illegal_move(expl['correction_explanation'], fens):
                 expl['correction_explanation'] = _describe_move(correction_fen, it.get('correction_best_san', ''))['summary']
 
         return explanations
