@@ -20,6 +20,7 @@ from helper_functions import (
     open_engine,
     eval_cp,
     classify_move,
+    best_is_winning_shot,
     best_line,
     san_line,
     humanish_reply,
@@ -947,7 +948,11 @@ def analyze_chessdotcom(body: AnalyzeChessDotComBody):
             if is_user_move:
                 move_number += 1
                 delta = curr_cp - prev_cp
-                cls = classify_move(prev_cp, curr_cp, best_eval_before, rating=user_rating)
+                # 'Miss' needs the move+board (was the best move a mate or a
+                # material-winning capture?), not just evals — compute it here.
+                shot = best_is_winning_shot(chess.Board(fen_before), best_san_before, best_eval_before)
+                cls = classify_move(prev_cp, curr_cp, best_eval_before, rating=user_rating,
+                                    best_is_winning_shot=shot)
 
                 # Time-pressure context: clock left after this move, time spent on it,
                 # and whether the player was in time pressure. None when no clock data.
@@ -1276,11 +1281,18 @@ def import_chessdotcom(body: ImportChessDotComBody):
         # Cheap shallow lookahead — the per-move label uses depth=8, so depth=4
         # here is enough to spot "you missed a much better move."
         best_eval_before = None
+        best_san_before = None
+        fen_before = board.fen()
         if is_user_move:
             with ENGINE_LOCK:
                 bl = best_line(ENGINE, board, depth=4, multipv=1, plies=1)
                 if bl:
                     best_eval_before = bl[0][1]  # score from user's POV (board.turn == user_color)
+                    if bl[0][0]:
+                        try:
+                            best_san_before = board.san(bl[0][0][0])
+                        except Exception:
+                            best_san_before = None
 
         board.push(move)
         with ENGINE_LOCK:
@@ -1289,7 +1301,9 @@ def import_chessdotcom(body: ImportChessDotComBody):
         if is_user_move:
             move_number += 1
             delta = curr_cp - prev_cp
-            cls = classify_move(prev_cp, curr_cp, best_eval_before, rating=user_rating)
+            shot = best_is_winning_shot(chess.Board(fen_before), best_san_before, best_eval_before)
+            cls = classify_move(prev_cp, curr_cp, best_eval_before, rating=user_rating,
+                                best_is_winning_shot=shot)
             clock_after = node.clock()
             tp_flag = under_time_pressure(clock_after, base_s)
             time_spent = None

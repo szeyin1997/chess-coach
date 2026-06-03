@@ -761,13 +761,20 @@ def _summarize_item_block(data: Dict[str, Any]) -> Dict[str, Any]:
       - fallback_summary: mechanical sentence used when LLM output is rejected
       - classification: classify_move's full dict
     """
-    from helper_functions import classify_move
+    from helper_functions import classify_move, best_is_winning_shot
     import chess as _chess
 
     eval_before = data.get('eval_before_cp', 0) or 0
     eval_after  = data.get('eval_after_cp',  0) or 0
     best_eval   = data.get('best_eval_cp')
     delta_cp    = eval_after - eval_before
+    # Was the best move a concrete winning shot? (mate or material-winning capture)
+    shot = None
+    try:
+        if data.get('fen'):
+            shot = best_is_winning_shot(_chess.Board(data['fen']), data.get('best_san'), best_eval)
+    except Exception:
+        shot = None
 
     # Compute classification at this endpoint's depth (19) — needed for win %
     # display fallback. We then override the framing-driving fields with the
@@ -775,7 +782,8 @@ def _summarize_item_block(data: Dict[str, Any]) -> Dict[str, Any]:
     # the frontend supplied them, so the FRAMING the LLM explains matches the
     # badge the user clicked. (The LLM no longer emits its own verdict — the
     # engine severity badge is the sole judgment.) See CLAUDE.md "no label_delta".
-    classification = classify_move(eval_before, eval_after, best_eval, rating=data.get('rating'))
+    classification = classify_move(eval_before, eval_after, best_eval, rating=data.get('rating'),
+                                   best_is_winning_shot=shot)
     ui_severity = data.get('severity')
     if ui_severity is not None:
         classification['label']              = data.get('label') or ui_severity

@@ -42,6 +42,14 @@ A move that throws the win away (drops below 70%) is NOT a Missed Win — it sta
 `Blunder/Mistake + Miss`. So a Missed Win never inflates the blunder count but is still flagged
 for review/drill (via `missed_opportunity`).
 
+**Declined-mate detection (don't remove).** `missed_opportunity` fires on a ≥15% best-vs-played
+win-gap — but that gate CANNOT catch a declined forced mate, because win% saturates (mate=100%
+vs still-winning ~91% is only ~9%, under 15%). So there's a second branch: if `best_eval ≥
+MATE_CP_SENTINEL` (9000; a mate sentinel, not real material), the played move isn't itself a
+mate (`eval_after < MATE_CP_SENTINEL`), and `win_after ≥ 70%`, it's a Missed Win. Without this,
+declining a mate while up a rook is mislabelled **Blunder** (the cp arm's −99367 sentinel wins).
+This was caught by `evals/run_classification_eval.py` (the `declined_mate_still_winning` case).
+
 **Rating-aware (research-backed, mirrors Chess.com's rating-dependent classifier).** When
 `rating` is supplied, the win%-delta thresholds AND the lower cp-delta boundaries
 (Good/Inaccuracy, Inaccuracy/Mistake) are scaled by `_rating_leniency_factor` —

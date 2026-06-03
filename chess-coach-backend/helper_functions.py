@@ -51,6 +51,61 @@ from config import (
 # win actually threw the game into the balance, so it stays a real mistake.
 WINNING_AFTER_THRESHOLD = 70.0
 
+# best_eval at/above this is a forced-mate SENTINEL (best_line scores mate as
+# ~100000), not real material — no legitimate material edge approaches +90 pawns.
+# Used to detect "a forced mate was available" independently of win%, which
+# saturates near 100% and hides declined mates from the win-gap test.
+MATE_CP_SENTINEL = 9000
+
+# 'Miss' fires only when the best move was a CONCRETE winning shot the player
+# passed up — a forced mate or a capture that wins material. These bound the
+# capture case (see docs/superpowers/specs/2026-06-04-miss-redefinition-design.md):
+MISS_MATERIAL_MIN = 2   # a winning capture must net >= a minor piece (a free pawn isn't a Miss)
+MISS_MARGIN = 100       # the played move must be >=100cp worse than best (i.e. you didn't play the shot)
+
+_PIECE_VALUE = {
+    chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+    chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 100,
+}
+
+
+def best_is_winning_shot(board: "chess.Board", best_san: Optional[str], best_eval_cp: Optional[int]) -> bool:
+    """Is the engine's best move a CONCRETE winning shot — a forced mate, or a
+    capture that nets material? `board` is the position BEFORE the move (player to
+    move).
+
+    This is what makes 'Miss' mean "you passed up a knockout" rather than "you
+    let an edge slip": a quiet/defensive best move (e.g. Qc5 just defending a
+    piece) or an even trade (e.g. Qxe3+ into a defended queen) returns False. The
+    classifier can't tell these apart from eval numbers alone — it needs the move
+    and the board, which is why this is computed by callers and passed in.
+    """
+    # Forced mate available (best_line scores mate as the ~100000 sentinel).
+    if best_eval_cp is not None and best_eval_cp >= MATE_CP_SENTINEL:
+        return True
+    if not best_san:
+        return False
+    try:
+        mv = board.parse_san(best_san)
+    except Exception:
+        return False
+    if not board.is_capture(mv):
+        return False
+    # Value of the captured piece (en passant takes a pawn off a different square).
+    if board.is_en_passant(mv):
+        captured_val = _PIECE_VALUE[chess.PAWN]
+    else:
+        cap = board.piece_at(mv.to_square)
+        captured_val = _PIECE_VALUE.get(cap.piece_type, 0) if cap else 0
+    capturer_val = _PIECE_VALUE.get(board.piece_at(mv.from_square).piece_type, 0)
+    # Simplified SEE: if the opponent can recapture on the target square, we net
+    # captured - capturer; if it's undefended, we keep the whole captured value.
+    after = board.copy()
+    after.push(mv)
+    can_recapture = bool(after.attackers(after.turn, mv.to_square))
+    net = (captured_val - capturer_val) if can_recapture else captured_val
+    return net >= MISS_MATERIAL_MIN
+
 
 def open_engine():
     """Open a Stockfish engine process via UCI.
@@ -203,7 +258,7 @@ def _rating_leniency_factor(rating: Optional[int]) -> float:
 
 
 def classify_move(eval_before_cp: int, eval_after_cp: int, best_eval_cp: Optional[int] = None,
-                  rating: Optional[int] = None) -> dict:
+                  rating: Optional[int] = None, best_is_winning_shot: Optional[bool] = None) -> dict:
     """Single source of truth for move severity, used by every endpoint.
 
     Combines two methods and TAKES THE WORSE verdict:
@@ -239,14 +294,21 @@ def classify_move(eval_before_cp: int, eval_after_cp: int, best_eval_cp: Optiona
     severity = max(cp_severity, win_severity, key=lambda s: _SEVERITY_RANK[s])
     created_problem = severity != "Good"
 
+    # 'Miss' = the player passed up a CONCRETE winning shot they didn't play.
+    # Two detectors, because the trigger info lives in different places:
+    #   - DECLINED MATE is visible from evals alone (best_eval is the mate
+    #     sentinel, eval_after is not), so it works for eval-only callers like the
+    #     classification eval harness. DON'T REMOVE — see CLAUDE.md "Declined-mate
+    #     detection". (win% can't catch it: mate 100% vs still-winning ~91% is <15%.)
+    #   - a material-winning CAPTURE needs the move + board, so the caller computes
+    #     best_is_winning_shot() and passes it. A quiet/defensive best move (Qc5)
+    #     or an even trade is NOT a shot — that's what removed the move-19 false Miss.
+    # The old broad win%-gap trigger is gone: it fired on ANY unplayed winning move.
+    win_best = win_percent(best_eval_cp) if best_eval_cp is not None else None
     missed_opportunity = False
-    win_best = None
-    if best_eval_cp is not None:
-        win_best = win_percent(best_eval_cp)
-        # Best move was clearly winning AND substantially better than what was played.
-        # Both conditions matter: a +20cp engine preference isn't a "missed win".
-        if (win_best - win_after) >= 15 and best_eval_cp >= 100:
-            missed_opportunity = True
+    if best_eval_cp is not None and (best_eval_cp - eval_after_cp) >= MISS_MARGIN:
+        declined_mate = best_eval_cp >= MATE_CP_SENTINEL and eval_after_cp < MATE_CP_SENTINEL
+        missed_opportunity = bool(best_is_winning_shot) or declined_mate
 
     # 'Missed Win': you declined a winning chance (often a forced mate) but the
     # move you played leaves you STILL clearly winning. The cp-delta arm brands
