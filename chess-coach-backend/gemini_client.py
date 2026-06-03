@@ -422,6 +422,70 @@ def _first_illegal_move(text: str, fens: list):
     return None
 
 
+# Attack/defense CLAIM patterns: "<verb> ... on <square>". Distinct from the
+# legal-move check — this verifies the TRUTH of a claim about a (legal) move,
+# e.g. "Qc5 attacks the queen on g3" (Qc5 is legal; the attack is fabricated).
+_ATTACK_CLAIM_RE = _re.compile(
+    r"(?P<verb>reveals an attack on|attacks?|attacking|attacked|threatens?|forks?|pins?|skewers?|"
+    r"defends?|defending|protects?|protecting)\s+(?P<mid>[^.;]*?)\bon\s+(?P<sq>[a-h][1-8])\b",
+    _re.IGNORECASE,
+)
+
+
+def _first_false_attack_claim(text: str, ctx: dict):
+    """Return the first attack/defense claim in `text` that does NOT hold on the
+    board, else None. Verifies the geometry the LLM asserts: for each
+    '<verb> ... on <square>' claim, push past the move and check whether the side
+    the claim attributes the attack to actually attacks that square.
+
+    Side is read from the possessive: 'defends YOUR knight on c4' -> the player
+    protects c4 (player must attack c4); 'attacks WHITE's queen on g3' -> the
+    player attacks g3; 'reveals an attack on YOUR bishop on f5' -> the opponent
+    attacks f5. Checked against the AFTER-move positions (the before-position is
+    excluded — a claim is about what the move creates, not the prior board).
+
+    A strong floor for the common phrasings, not a perfect guarantee: it catches
+    'attacks the X on <sq>' fabrications (the g3 class); exotic wordings may slip.
+    """
+    import chess as _chess
+    if not text:
+        return None
+    facts = ctx.get("facts") or {}
+    pc = facts.get("player_color")
+    if pc not in ("White", "Black"):
+        return None
+    player = _chess.WHITE if pc == "White" else _chess.BLACK
+    # After-move positions only (skip fens[0] = the position before the move).
+    boards = []
+    for f in (ctx.get("fens") or [])[1:]:
+        try:
+            boards.append(_chess.Board(f))
+        except Exception:
+            pass
+    if not boards:
+        return None
+
+    for m in _ATTACK_CLAIM_RE.finditer(text):
+        verb = m.group("verb").lower()
+        mid = m.group("mid").lower()
+        sq = _chess.parse_square(m.group("sq"))
+        is_defense = verb.startswith(("defend", "protect"))
+        owns_target = bool(_re.search(r"\b(your|our|my)\b", mid))
+        if not is_defense and (owns_target or verb == "reveals an attack on"):
+            # An attack ON the player's own piece is attributed to the OPPONENT.
+            # These come from the verified opponent-reply facts and can be true
+            # several plies deep (e.g. a fork after the opponent's reply), so
+            # verifying them risks stripping a TRUE claim. Skip — the high-value,
+            # low-risk target is the player claiming to attack/defend a square
+            # (the 'Qc5 attacks g3' fabrication).
+            continue
+        attacker = player  # player attacks opponent's piece, or defends its own
+        if not any(b.is_attacked_by(attacker, sq) for b in boards):
+            logger.warning("rejecting false attack claim: %r on %s", verb, m.group("sq"))
+            return f"{verb} on {m.group('sq')}"
+    return None
+
+
 def _compute_chess_facts(fen_before: str, player_san: str, pv_played_san: str, best_san: str) -> dict:
     """Use python-chess to derive verified facts about a move. No LLM involved."""
     import chess as _chess
@@ -946,9 +1010,12 @@ def _validate_summarize_result(result: Dict[str, Any], ctx: Dict[str, Any]) -> D
     #       concrete specifics at all — no squares, no SAN moves. Catches the
     #       LLM dodging by going fully generic ("decisive advantage") instead.
     def _ok_basic(s: str) -> bool:
-        # Reject if ANY cited move (piece or pawn-suggestion) is illegal in every
-        # relevant position, or if the phrasing is a forbidden hand-wave.
-        return _first_illegal_move(s, fens) is None and not _is_vague(s)
+        # Reject if ANY cited move is illegal in every relevant position, if an
+        # attack/defense claim doesn't hold on the board (the 'Qc5 attacks g3'
+        # class), or if the phrasing is a forbidden hand-wave.
+        return (_first_illegal_move(s, fens) is None
+                and _first_false_attack_claim(s, ctx) is None
+                and not _is_vague(s))
     def _ok_concrete(s: str) -> bool:
         return _ok_basic(s) and _has_specifics(s)
 
