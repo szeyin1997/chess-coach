@@ -432,6 +432,41 @@ _ATTACK_CLAIM_RE = _re.compile(
 )
 
 
+def _san_piece_type_code(san: str) -> Optional[int]:
+    """Piece-type constant for the piece being moved, read from SAN notation alone.
+    Returns None if the SAN is unrecognised."""
+    import chess as _chess
+    if not san:
+        return None
+    if san.startswith("O"):          # O-O or O-O-O
+        return _chess.KING
+    c = san[0]
+    if c == "N": return _chess.KNIGHT
+    if c == "K": return _chess.KING
+    if c == "B": return _chess.BISHOP
+    if c == "R": return _chess.ROOK
+    if c == "Q": return _chess.QUEEN
+    if c.islower(): return _chess.PAWN
+    return None
+
+
+def _san_attacks_sq(san: str, sq: int, boards: list) -> bool:
+    """Return True if the piece that plays `san` attacks `sq` after the move,
+    in any of the supplied boards. Used for the attacker-identity check (A)."""
+    import chess as _chess
+    for b in boards:
+        try:
+            move = b.parse_san(san)
+        except Exception:
+            continue
+        dest = move.to_square
+        nb = b.copy()
+        nb.push(move)
+        if sq in nb.attacks(dest):
+            return True
+    return False
+
+
 def _first_false_attack_claim(text: str, ctx: dict):
     """Return the first attack/defense claim in `text` that does NOT hold on the
     board, else None. Verifies the geometry the LLM asserts: for each
@@ -471,14 +506,29 @@ def _first_false_attack_claim(text: str, ctx: dict):
         sq = _chess.parse_square(m.group("sq"))
         is_defense = verb.startswith(("defend", "protect"))
         owns_target = bool(_re.search(r"\b(your|our|my)\b", mid))
+
+        # Nearest SAN token to the LEFT of this verb — the named piece, if any.
+        sans_before = _SAN_RE.findall(text[:m.start()])
+        san_left = sans_before[-1] if sans_before else None
+
+        # B — impossible-geometry guard: pawn, knight, and king cannot pin or skewer.
+        # Zero false-positive risk — these pieces have no ray attacks, ever.
+        if verb in ("pin", "pins", "skewer", "skewers") and san_left:
+            pt = _san_piece_type_code(san_left)
+            if pt in (_chess.PAWN, _chess.KNIGHT, _chess.KING):
+                logger.warning("rejecting impossible-geometry claim: %r names non-sliding %s", verb, san_left)
+                return f"{verb} on {m.group('sq')}"
+
         if not is_defense and (owns_target or verb == "reveals an attack on"):
-            # An attack ON the player's own piece is attributed to the OPPONENT.
-            # These come from the verified opponent-reply facts and can be true
-            # several plies deep (e.g. a fork after the opponent's reply), so
-            # verifying them risks stripping a TRUE claim. Skip — the high-value,
-            # low-risk target is the player claiming to attack/defend a square
-            # (the 'Qc5 attacks g3' fabrication).
+            # A — attacker-identity check: when a SAN is named, verify the moved
+            # piece actually attacks sq. Safe only when a SAN is named (1-ply,
+            # fully-determined) — no SAN means a deep-PV threat, so preserve the
+            # safety valve (skip) to avoid stripping a true claim.
+            if san_left and not _san_attacks_sq(san_left, sq, boards):
+                logger.warning("rejecting false attacker-identity claim: %r does not attack %s", san_left, m.group("sq"))
+                return f"{verb} on {m.group('sq')}"
             continue
+
         attacker = player  # player attacks opponent's piece, or defends its own
         if not any(b.is_attacked_by(attacker, sq) for b in boards):
             logger.warning("rejecting false attack claim: %r on %s", verb, m.group("sq"))
@@ -1504,12 +1554,20 @@ TASK — respond with JSON only (no markdown fences):
 
 1. "improvement_lever": 2–3 sentences. The single most impactful thing to fix.
    RULES:
-   - Base it on the #1 weakness above, the phase where errors cluster most, AND the primary failure mode.
+   - Base it on the #1 weakness above, the phase where errors cluster most, the primary
+     failure mode, AND the TIME PROFILE above.
    - Be specific to THIS player's data — name the pattern, when it happens, and what to do instead.
-   - If the primary failure mode is DEFENSIVE: the lever must be a defensive habit
-     (e.g. "before every move, scan opponent's checks/captures/threats"), NOT
-     "find more tactics." A player who keeps getting forked doesn't need to find
-     more forks — they need to spot when one is about to land on them.
+   - If the primary failure mode is DEFENSIVE: the lever must be a defensive habit, NOT
+     "find more tactics." A player who keeps getting forked doesn't need to find more
+     forks — they need to spot when one is about to land on them. Frame the habit as the
+     one-question safety check on the move they're about to play ("Is it safe? — can my
+     opponent reply with a capture/check/threat I can't meet?"), NOT a slow scan of every
+     check/capture/threat on the board.
+   - Let the TIME PROFILE steer the lever: if TIME-PRESSURE-DRIVEN, the most impactful fix
+     is usually time management / playing slower time controls (Rapid not Blitz) so there's
+     time for that check — say so. If RECOGNITION-DRIVEN, the fix is the safety-check habit
+     plus faster threat-spotting (puzzles). If UNKNOWN, default to the safety-check habit
+     and do NOT cite time pressure.
    - At 500–800: the issue is usually one-move oversights and missing opponent's
      immediate threats. At 800–1200: missing 2-move combinations and calculation depth.
    - Write as: "In your games, [specific recurring situation]. When this happens, [what goes wrong].
