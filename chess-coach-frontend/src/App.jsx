@@ -728,9 +728,11 @@ export default function App() {
         if (hintRes.data?.best_uci) {
           const hfrom = hintRes.data.best_uci.slice(0, 2);
           const hto   = hintRes.data.best_uci.slice(2, 4);
-          setReviewPositions(prev =>
-            prev.map((p, i) => i === absIdx ? { ...p, bestMove: { from: hfrom, to: hto } } : p)
-          );
+          if (reviewSelectedMoveRef.current === move) {
+            setReviewPositions(prev =>
+              prev.map((p, i) => i === absIdx ? { ...p, bestMove: { from: hfrom, to: hto } } : p)
+            );
+          }
         }
       } catch {}
     });
@@ -1788,14 +1790,15 @@ export default function App() {
                         }}
                         boardOrientation={info.user_color === "black" ? "black" : "white"}
                         animationDuration={150}
-                        customSquareStyles={(() => {
-                          const s = {};
-                          if (!tryCurrentFen && reviewPosIndex === 0 && reviewBestMove) {
-                            s[reviewBestMove.from] = { boxShadow:"inset 0 0 0 3px var(--green)" };
-                            s[reviewBestMove.to]   = { boxShadow:"inset 0 0 0 4px var(--green)", background:"rgba(72,187,120,.2)" };
-                          }
-                          return s;
-                        })()}
+                        customArrows={
+                          !tryCurrentFen && reviewPositions[reviewPosIndex]?.bestMove
+                            ? [[
+                                reviewPositions[reviewPosIndex].bestMove.from,
+                                reviewPositions[reviewPosIndex].bestMove.to,
+                                "rgb(163,213,255)"
+                              ]]
+                            : []
+                        }
                       />
 
                       {/* Review nav (hidden in try mode) */}
