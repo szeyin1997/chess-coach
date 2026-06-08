@@ -712,7 +712,28 @@ export default function App() {
       } catch {}
     }
 
+    // Seed pos-0 bestMove from LLM cache so the arrow shows immediately on re-click.
+    if (cached) {
+      const bm0 = bestMoveFromExplanation(cached, fenBefore);
+      if (bm0) positions[0] = { ...positions[0], bestMove: { from: bm0.from, to: bm0.to } };
+    }
+
     setReviewPositions(positions); setReviewPosIndex(0); setReviewFen(fenBefore);
+
+    // Parallel best-move hints for positions 1+ (pos 0 handled separately).
+    positions.slice(1).forEach(async (pos, relIdx) => {
+      const absIdx = relIdx + 1;
+      try {
+        const hintRes = await axios.post(`${API}/hint`, { fen: pos.fen });
+        if (hintRes.data?.best_uci) {
+          const hfrom = hintRes.data.best_uci.slice(0, 2);
+          const hto   = hintRes.data.best_uci.slice(2, 4);
+          setReviewPositions(prev =>
+            prev.map((p, i) => i === absIdx ? { ...p, bestMove: { from: hfrom, to: hto } } : p)
+          );
+        }
+      } catch {}
+    });
 
     // Fetch best-move hint (fast). Skipped when we already populated bestMove
     // from a cached LLM explanation — that's the depth=19 ground truth and
@@ -726,6 +747,9 @@ export default function App() {
           let displayText = `to ${to}`;
           try { const c = new Chess(fenBefore); const piece = c.get(from); if (piece) displayText = `${NAMES[piece.type]} to ${to}`; } catch {}
           setReviewBestMove({ from, to, displayText });
+          setReviewPositions(prev =>
+            prev.map((p, i) => i === 0 ? { ...p, bestMove: { from, to } } : p)
+          );
         }
       } catch {}
     }
