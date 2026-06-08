@@ -748,10 +748,12 @@ export default function App() {
           const NAMES = { p:"Pawn", n:"Knight", b:"Bishop", r:"Rook", q:"Queen", k:"King" };
           let displayText = `to ${to}`;
           try { const c = new Chess(fenBefore); const piece = c.get(from); if (piece) displayText = `${NAMES[piece.type]} to ${to}`; } catch {}
-          setReviewBestMove({ from, to, displayText });
-          setReviewPositions(prev =>
-            prev.map((p, i) => i === 0 ? { ...p, bestMove: { from, to } } : p)
-          );
+          if (reviewSelectedMoveRef.current === move) {
+            setReviewBestMove({ from, to, displayText });
+            setReviewPositions(prev =>
+              prev.map((p, i) => i === 0 ? { ...p, bestMove: { from, to } } : p)
+            );
+          }
         }
       } catch {}
     }
