@@ -63,6 +63,11 @@ MATE_CP_SENTINEL = 9000
 MISS_MATERIAL_MIN = 2   # a winning capture must net >= a minor piece (a free pawn isn't a Miss)
 MISS_MARGIN = 100       # the played move must be >=100cp worse than best (i.e. you didn't play the shot)
 
+# Win% loss (percentage points, 0–100 scale) below which a Good move is labelled
+# "Excellent" — mirrors Chess.com's Expected Points Model threshold of 0.02 EP.
+# Moves at or above this threshold (but still Good severity) are labelled "Good".
+EXCELLENT_WIN_LOSS_THRESHOLD = 2.0
+
 _PIECE_VALUE = {
     chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
     chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 100,
@@ -258,7 +263,8 @@ def _rating_leniency_factor(rating: Optional[int]) -> float:
 
 
 def classify_move(eval_before_cp: int, eval_after_cp: int, best_eval_cp: Optional[int] = None,
-                  rating: Optional[int] = None, best_is_winning_shot: Optional[bool] = None) -> dict:
+                  rating: Optional[int] = None, best_is_winning_shot: Optional[bool] = None,
+                  played_best: bool = False) -> dict:
     """Single source of truth for move severity, used by every endpoint.
 
     Combines two methods and TAKES THE WORSE verdict:
@@ -331,6 +337,13 @@ def classify_move(eval_before_cp: int, eval_after_cp: int, best_eval_cp: Optiona
         label = f"{severity} + Miss"
     elif missed_opportunity:
         label = "Miss"
+    elif severity == "Good":
+        if played_best:
+            label = "Best"
+        elif win_loss < EXCELLENT_WIN_LOSS_THRESHOLD:
+            label = "Excellent"
+        else:
+            label = "Good"
     else:
         label = severity
 
