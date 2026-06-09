@@ -951,8 +951,9 @@ def analyze_chessdotcom(body: AnalyzeChessDotComBody):
                 # 'Miss' needs the move+board (was the best move a mate or a
                 # material-winning capture?), not just evals — compute it here.
                 shot = best_is_winning_shot(chess.Board(fen_before), best_san_before, best_eval_before)
+                played_best_flag = bool(best_san_before and san == best_san_before)
                 cls = classify_move(prev_cp, curr_cp, best_eval_before, rating=user_rating,
-                                    best_is_winning_shot=shot)
+                                    best_is_winning_shot=shot, played_best=played_best_flag)
 
                 # Time-pressure context: clock left after this move, time spent on it,
                 # and whether the player was in time pressure. None when no clock data.
