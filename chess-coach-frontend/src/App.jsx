@@ -2163,8 +2163,8 @@ export default function App() {
                 {pairedMoves.map(pair => (
                   <div key={pair.num} className="move-row">
                     <span className="move-num">{pair.num}.</span>
-                    <span className={`move-cell ${moveBadgeClass(pair.white?.label)}`}>{pair.white?.san || "…"}</span>
-                    <span className={`move-cell ${moveBadgeClass(pair.black?.label)}`}>{pair.black?.san || ""}</span>
+                    <span className={`move-cell ${moveBadgeClass(pair.white?.label) || "good"}`}>{pair.white?.san || "…"}</span>
+                    <span className={`move-cell ${moveBadgeClass(pair.black?.label) || "good"}`}>{pair.black?.san || ""}</span>
                   </div>
                 ))}
               </div>
@@ -2285,8 +2285,8 @@ export default function App() {
                 {pairedMoves.map(pair => (
                   <div key={pair.num} className="move-row">
                     <span className="move-num">{pair.num}.</span>
-                    <span className={`move-cell ${moveBadgeClass(pair.white?.label)}`}>{pair.white?.san||"…"}</span>
-                    <span className={`move-cell ${moveBadgeClass(pair.black?.label)}`}>{pair.black?.san||""}</span>
+                    <span className={`move-cell ${moveBadgeClass(pair.white?.label) || "good"}`}>{pair.white?.san||"…"}</span>
+                    <span className={`move-cell ${moveBadgeClass(pair.black?.label) || "good"}`}>{pair.black?.san||""}</span>
                   </div>
                 ))}
               </div>
