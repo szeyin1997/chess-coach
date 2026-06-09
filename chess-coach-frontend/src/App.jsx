@@ -218,7 +218,7 @@ function ExplainPanel({ explanation, bestMove, explaining, posIndex, onAnalyze, 
   if (!explanation && !bestMove && !onAnalyze) {
     return (
       <div style={{ color: "var(--text-muted)", fontSize: 13, fontStyle: "italic", paddingTop: 8 }}>
-        Click a mistake in the list to see the position.
+        Click a move in the list to see the position.
       </div>
     );
   }
