@@ -54,3 +54,11 @@ def test_inaccuracy_not_affected():
     result = classify_move(200, 100, played_best=False)
     assert result["severity"] == "Inaccuracy"
     assert result["label"] == "Inaccuracy"
+
+
+def test_played_best_ignored_on_non_good_severity():
+    """played_best=True has no effect when severity is Mistake — label stays 'Mistake'."""
+    # cp 200 → -100: delta = -300, at the Mistake/Blunder floor → Mistake severity
+    result = classify_move(200, -100, played_best=True)
+    assert result["severity"] == "Mistake"
+    assert result["label"] == "Mistake"
