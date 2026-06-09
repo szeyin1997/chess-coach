@@ -60,4 +60,4 @@ def test_plain_blunder_unaffected():
 def test_good_move_unaffected():
     r = classify_move(eval_before_cp=30, eval_after_cp=20, best_eval_cp=30)
     assert r["missed_win"] is False
-    assert r["label"] == "Good"
+    assert r["label"] == "Excellent"
