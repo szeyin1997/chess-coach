@@ -1863,9 +1863,14 @@ export default function App() {
                           explaining={reviewExplaining}
                           batchLoading={batchInFlightGame === selectedGameIndex}
                           posIndex={reviewPosIndex}
-                          onAnalyze={reviewSelectedMove && !reviewExplanation && !reviewExplaining
-                            ? () => fetchMistakeExplanation(reviewSelectedMove, selectedGame?.moves, selectedGameIndex)
-                            : null}
+                          onAnalyze={
+                            reviewSelectedMove &&
+                            ["Mistake", "Blunder"].includes(reviewSelectedMove.severity) &&
+                            !reviewExplanation &&
+                            !reviewExplaining
+                              ? () => fetchMistakeExplanation(reviewSelectedMove, selectedGame?.moves, selectedGameIndex)
+                              : null
+                          }
                         />
                       )}
                     </div>
