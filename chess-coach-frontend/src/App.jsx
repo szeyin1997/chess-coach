@@ -17,7 +17,8 @@ const API = "http://127.0.0.1:8000";
 //          9 = drills now only for blunders and missed wins (mistakes excluded).
 //         10 = adds missed_win flag + "Missed Win" label (missed-mate-still-winning
 //              no longer mislabelled as Blunder; severity drops to the win% arm).
-const ANALYSIS_CACHE_VERSION = 10;
+//         11 = label now distinguishes Best/Excellent/Good for positive moves.
+const ANALYSIS_CACHE_VERSION = 11;
 
 function readAnalysisCache(username) {
   try {
@@ -70,12 +71,13 @@ const THEME_LABELS = {
 function moveBadgeClass(label) {
   if (!label) return "";
   const l = label.toLowerCase();
-  // Composite labels like "Blunder + Miss" — color by severity, miss is conveyed in text
   if (l.includes("blunder"))    return "blunder";
   if (l.includes("mistake"))    return "mistake";
   if (l.includes("inaccuracy")) return "inaccuracy";
   if (l.includes("miss"))       return "miss";   // "Miss" and "Missed Win"
-  return "good";
+  if (l === "best")             return "best";
+  if (l === "excellent")        return "excellent";
+  return "";  // "Good" and anything else: no colored badge
 }
 
 // ── Small reusable components ──────────────────────────────────────────────
@@ -95,7 +97,9 @@ function TabBar({ active, onChange }) {
 
 function MoveBadge({ label }) {
   if (!label) return null;
-  return <span className={`badge badge-${moveBadgeClass(label)}`}>{label}</span>;
+  const cls = moveBadgeClass(label);
+  if (!cls) return null;
+  return <span className={`badge badge-${cls}`}>{label}</span>;
 }
 
 function EvalBar({ white, black, cap = 800 }) {
