@@ -653,7 +653,7 @@ export default function App() {
     } finally { setAnalyzingGames(false); }
   }
 
-  async function selectMistakeForReview(move, allGameMoves) {
+  async function selectMoveForReview(move, allGameMoves) {
     setReviewMoveNumber(move.move_number);
     setReviewPositions([]); setReviewPosIndex(0);
     setReviewSelectedMove(move);
@@ -801,7 +801,7 @@ export default function App() {
   function summaryCacheKey(fen, uci) { return `${fen}::${uci}`; }
 
   // Filter a game's moves down to the ones worth analyzing (Mistakes, Blunders,
-  // or missed opportunities — same gate as the per-game drill-down badMoves).
+  // or missed opportunities — same gate as the per-game drill-down allMoves filter).
   function flaggedMovesIn(gameMoves) {
     return (gameMoves || []).filter(m =>
       ["Mistake", "Blunder"].includes(m.severity) || m.missed_opportunity
@@ -1706,9 +1706,7 @@ export default function App() {
               const { label: resLabel, cls: resCls } = gameResult(info.result);
               // Filter on severity (base label only — not composite "Blunder + Miss" strings)
               // or missed_opportunity, so we catch every flagged move.
-              const badMoves = selectedGame.moves.filter(m =>
-                ["Mistake","Blunder"].includes(m.severity) || m.missed_opportunity
-              );
+              const allMoves = selectedGame.moves;
               return (
                 <div>
                   <button className="btn-ghost" style={{ marginBottom:12, display:"flex", alignItems:"center", gap:4 }}
@@ -1743,28 +1741,29 @@ export default function App() {
                   {/* 3-column: mistake list | board | explanation */}
                   <div style={{ display:"grid", gridTemplateColumns:"200px minmax(0,auto) 1fr", gap:14, alignItems:"start" }}>
 
-                    {/* Col 1: mistake list */}
+                    {/* Col 1: full move list */}
                     <div className="card scroll-panel" style={{ maxHeight:480, padding:"10px 8px" }}>
                       <div style={{ fontSize:11, fontWeight:700, letterSpacing:".06em", textTransform:"uppercase", color:"var(--text-muted)", padding:"0 4px 8px" }}>
-                        Mistakes ({badMoves.length})
+                        Moves ({allMoves.length})
                       </div>
-                      <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
-                        {badMoves.map((m, i) => {
+                      <div style={{ display:"flex", flexDirection:"column", gap:2 }}>
+                        {allMoves.map((m, i) => {
                           const isHighlighted = selectedOccurrence?.move_numbers?.includes(m.move_number);
                           const isSelected = reviewMoveNumber === m.move_number;
+                          const badgeCls = moveBadgeClass(m.label);
                           return (
-                            <button key={i} onClick={() => selectMistakeForReview(m, selectedGame.moves)}
+                            <button key={i} onClick={() => selectMoveForReview(m, selectedGame.moves)}
                               className={`mistake-btn${isSelected?" active":isHighlighted?" highlighted":""}`}>
-                              <span>
-                                {isHighlighted && <span style={{ marginRight:4, color:"var(--orange)" }}>●</span>}
-                                <span style={{ color:"var(--text-muted)", fontSize:11, marginRight:4 }}>#{m.move_number}</span>
+                              <span style={{ display:"flex", alignItems:"center", gap:4 }}>
+                                {isHighlighted && <span style={{ color:"var(--orange)" }}>●</span>}
+                                <span style={{ color:"var(--text-muted)", fontSize:11, minWidth:20 }}>#{m.move_number}</span>
                                 <span style={{ fontFamily:"monospace", fontWeight:600 }}>{m.san}</span>
                               </span>
-                              <MoveBadge label={m.label} />
+                              {badgeCls && <MoveBadge label={m.label} />}
                             </button>
                           );
                         })}
-                        {badMoves.length === 0 && <div style={{ fontSize:12, color:"var(--text-muted)", padding:"4px" }}>No mistakes found.</div>}
+                        {allMoves.length === 0 && <div style={{ fontSize:12, color:"var(--text-muted)", padding:"4px" }}>No moves found.</div>}
                       </div>
                     </div>
 
